@@ -1,725 +1,538 @@
 import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter
-import re
-from typing import List, Dict, Optional, Tuple, Any
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Set
 from collections import defaultdict
-import json
-import os
-from datetime import datetime, date
+from dataclasses import dataclass
+from enum import Enum
 
-class SmartExcelTableExtractor:
-    def __init__(self, file_path: str, config_file: str = 'table_detection_config.json'):
+@dataclass
+class DataBlock:
+    """Represents a consistent data block"""
+    start_row: int
+    end_row: int
+    start_col: int
+    end_col: int
+    consistency_score: float
+    data_type: str  # 'numeric', 'mixed', 'text'
+    row_consistency: float
+    col_consistency: float
+
+class ConsistencyBasedDetector:
+    """
+    Detects tables by analyzing data consistency patterns.
+    Tables are characterized by:
+    1. Consistent number of non-empty cells per row
+    2. Consistent data types across rows for same column
+    3. Contiguous blocks of data
+    4. Separator rows (empty or different patterns)
+    """
+    
+    def __init__(self, 
+                 min_rows: int = 3,
+                 min_cols: int = 2,
+                 consistency_threshold: float = 0.8,
+                 max_gap_rows: int = 1):
         """
-        Initialize the Smart Excel Table Extractor
-        
         Parameters:
-        - file_path: path to Excel file
-        - config_file: JSON file to store manual configurations for reuse
+        - min_rows: Minimum rows to consider as table
+        - min_cols: Minimum columns to consider as table
+        - consistency_threshold: How consistent rows/columns must be (0-1)
+        - max_gap_rows: Maximum empty rows allowed within table (1 means single empty row allowed)
         """
-        self.file_path = file_path
-        self.config_file = config_file
-        self.wb = None
-        self.saved_configs = self.load_saved_configs()
-        
-    def load_workbook(self):
-        """Load workbook with data_only=True to get calculated values"""
-        self.wb = openpyxl.load_workbook(self.file_path, data_only=True)
-        
-    def close_workbook(self):
-        """Close workbook to free memory"""
-        if self.wb:
-            self.wb.close()
+        self.min_rows = min_rows
+        self.min_cols = min_cols
+        self.consistency_threshold = consistency_threshold
+        self.max_gap_rows = max_gap_rows
     
-    def load_saved_configs(self) -> Dict:
-        """Load previously saved configurations"""
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-    
-    def save_config_to_file(self, sheet_name: str, config: Dict):
-        """Save configuration for future use"""
-        file_key = os.path.basename(self.file_path)
-        if file_key not in self.saved_configs:
-            self.saved_configs[file_key] = {}
+    def analyze_row_consistency(self, sheet, row_idx: int, col_range: range) -> Dict:
+        """Analyze consistency of a single row"""
+        row_data = []
+        non_empty_count = 0
+        data_types = []
         
-        self.saved_configs[file_key][sheet_name] = config
-        
-        with open(self.config_file, 'w') as f:
-            json.dump(self.saved_configs, f, indent=2)
-        
-        print(f"  ✓ Configuration saved for future use")
-    
-    # ============= DETECTION STRATEGY 1: Pattern-Based Detection =============
-    def detect_by_pattern(self, sheet) -> Optional[Dict]:
-        """Detect table using pattern matching (fiscal years, totals, etc.)"""
-        patterns = {
-            'fiscal_years': re.compile(r'FY\d{4}|20\d{2}|\d{4}'),
-            'totals': re.compile(r'total|sum|合计', re.IGNORECASE),
-            'headers': re.compile(r'^(actual|baseline|forecast|budget|fy)', re.IGNORECASE),
-        }
-        
-        scores = defaultdict(lambda: defaultdict(int))
-        data_columns = set()
-        
-        for row_idx in range(min(30, sheet.max_row)):
-            for col_idx in range(1, min(sheet.max_column + 1, 20)):
-                cell = sheet.cell(row_idx + 1, col_idx).value
-                if cell:
-                    cell_str = str(cell).strip()
-                    
-                    if patterns['fiscal_years'].search(cell_str):
-                        scores[row_idx]['is_header'] += 3
-                        data_columns.add(col_idx)
-                    
-                    if patterns['totals'].search(cell_str):
-                        scores[row_idx]['is_total_row'] += 2
-                    
-                    if patterns['headers'].search(cell_str):
-                        scores[row_idx]['is_section_header'] += 2
-        
-        if scores:
-            # Find row with highest header score
-            best_row = max(scores.keys(), key=lambda x: scores[x]['is_header'])
-            if scores[best_row]['is_header'] >= 3:
-                return {
-                    'header_row': best_row,
-                    'data_columns': sorted(list(data_columns)),
-                    'method': 'pattern_detection'
-                }
-        return None
-    
-    # ============= DETECTION STRATEGY 2: Statistical Detection =============
-    def detect_by_statistics(self, sheet) -> Optional[Dict]:
-        """Detect table by analyzing data type distribution"""
-        
-        def get_row_type_distribution(row_idx):
-            types = {'numeric': 0, 'date': 0, 'string': 0, 'empty': 0}
-            for col_idx in range(1, min(sheet.max_column + 1, 30)):
-                cell = sheet.cell(row_idx + 1, col_idx).value
-                if cell is None or str(cell).strip() == '':
-                    types['empty'] += 1
-                elif isinstance(cell, (int, float)):
-                    types['numeric'] += 1
-                elif isinstance(cell, (datetime, date)):
-                    types['date'] += 1
-                elif isinstance(cell, str):
-                    if re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', cell):
-                        types['date'] += 1
+        for col_idx in col_range:
+            cell = sheet.cell(row_idx + 1, col_idx).value
+            if cell is not None and str(cell).strip():
+                non_empty_count += 1
+                row_data.append(cell)
+                # Detect data type
+                if isinstance(cell, (int, float)):
+                    data_types.append('numeric')
+                elif isinstance(cell, (str,)):
+                    if re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', str(cell)):
+                        data_types.append('date')
                     else:
-                        types['string'] += 1
-            return types
+                        data_types.append('text')
+                else:
+                    data_types.append('other')
+            else:
+                row_data.append(None)
+                data_types.append('empty')
         
-        # Analyze first 30 rows
-        row_profiles = []
-        for row_idx in range(min(30, sheet.max_row)):
-            profile = get_row_type_distribution(row_idx)
-            profile['row_idx'] = row_idx
-            row_profiles.append(profile)
+        # Calculate row metrics
+        total_cols = len(col_range)
+        fill_rate = non_empty_count / total_cols if total_cols > 0 else 0
         
-        # Find transition from strings (headers) to numbers (data)
-        header_candidates = []
-        data_start_candidates = []
+        # Determine row type
+        if fill_rate >= 0.7:
+            if data_types.count('numeric') > data_types.count('text'):
+                row_type = 'numeric_row'
+            elif data_types.count('text') > 0:
+                row_type = 'text_row'
+            else:
+                row_type = 'mixed_row'
+        elif fill_rate > 0:
+            row_type = 'sparse_row'
+        else:
+            row_type = 'empty_row'
         
-        for i, profile in enumerate(row_profiles):
-            if profile['string'] >= 3 and profile['numeric'] < profile['string']:
-                header_candidates.append(i)
-            elif profile['numeric'] >= 3 and profile['numeric'] > profile['string']:
-                data_start_candidates.append(i)
-        
-        if header_candidates and data_start_candidates:
-            header_row = max(header_candidates)
-            data_start = min([d for d in data_start_candidates if d > header_row])
-            
-            # Determine data columns (columns with numeric data in first few data rows)
-            data_columns = []
-            for col_idx in range(1, min(sheet.max_column + 1, 20)):
-                numeric_count = 0
-                for row_idx in range(data_start, min(data_start + 5, sheet.max_row)):
-                    cell = sheet.cell(row_idx + 1, col_idx).value
-                    if isinstance(cell, (int, float)):
-                        numeric_count += 1
-                if numeric_count >= 3:
-                    data_columns.append(col_idx)
-            
-            if data_columns:
-                return {
-                    'header_row': header_row,
-                    'data_start': data_start,
-                    'data_columns': data_columns,
-                    'method': 'statistical_detection'
-                }
-        
-        return None
+        return {
+            'row_idx': row_idx,
+            'non_empty_count': non_empty_count,
+            'fill_rate': fill_rate,
+            'data_types': data_types,
+            'row_type': row_type,
+            'has_data': non_empty_count > 0
+        }
     
-    # ============= DETECTION STRATEGY 3: Excel Table Object Detection =============
-    def detect_excel_table_object(self, sheet) -> Optional[Dict]:
-        """Detect if Excel has formatted tables (Ctrl+T)"""
-        if sheet.tables:
-            # Get the first table
-            table = list(sheet.tables.values())[0]
-            ref = table.ref
-            
-            # Parse table reference (e.g., "A1:F20")
-            match = re.match(r'([A-Z]+)(\d+):([A-Z]+)(\d+)', ref)
-            if match:
-                start_col_letter, start_row, end_col_letter, end_row = match.groups()
-                
-                start_col = openpyxl.utils.column_index_from_string(start_col_letter)
-                end_col = openpyxl.utils.column_index_from_string(end_col_letter)
-                start_row = int(start_row) - 1  # Convert to 0-index
-                end_row = int(end_row) - 1
-                
-                # Determine header row (first row of table)
-                header_row = start_row
-                data_columns = list(range(start_col, end_col + 1))
-                
-                return {
-                    'header_row': header_row,
-                    'data_start': start_row + 1,
-                    'data_end': end_row,
-                    'data_columns': data_columns,
-                    'method': 'excel_table_object'
-                }
-        return None
-    
-    # ============= DETECTION STRATEGY 4: Fiscal Year Pattern Detection =============
-    def detect_fiscal_year_pattern(self, sheet) -> Optional[Dict]:
-        """Specifically look for fiscal year patterns in headers"""
-        fiscal_year_pattern = re.compile(r'FY\d{4}|20\d{2}')
+    def find_consistent_columns(self, sheet, start_row: int, end_row: int) -> List[int]:
+        """
+        Find which columns have consistent data across rows
+        Returns list of column indices that are consistently filled
+        """
+        if start_row > end_row:
+            return []
         
-        for row_idx in range(min(20, sheet.max_row)):
-            data_columns = []
-            for col_idx in range(1, min(sheet.max_column + 1, 20)):
+        # Analyze each column's consistency
+        col_consistency = {}
+        
+        for col_idx in range(1, min(sheet.max_column + 1, 30)):  # Check first 30 columns
+            fill_counts = []
+            data_types = []
+            
+            for row_idx in range(start_row, end_row + 1):
                 cell = sheet.cell(row_idx + 1, col_idx).value
-                if cell:
-                    cell_str = str(cell).strip()
-                    if fiscal_year_pattern.search(cell_str) or (cell_str.isdigit() and len(cell_str) == 4):
-                        data_columns.append(col_idx)
+                if cell is not None and str(cell).strip():
+                    fill_counts.append(1)
+                    if isinstance(cell, (int, float)):
+                        data_types.append('numeric')
+                    else:
+                        data_types.append('text')
+                else:
+                    fill_counts.append(0)
+                    data_types.append('empty')
             
-            if len(data_columns) >= 3:
-                # Find label column (first column with text before data columns)
-                label_column = 1
-                min_data_col = min(data_columns)
-                for col_idx in range(1, min_data_col):
-                    has_text = False
-                    for check_row in range(row_idx + 1, min(row_idx + 10, sheet.max_row)):
-                        check_cell = sheet.cell(check_row + 1, col_idx).value
-                        if check_cell and isinstance(check_cell, str) and len(str(check_cell).strip()) > 0:
-                            has_text = True
-                            break
-                    if has_text:
-                        label_column = col_idx
-                        break
+            if fill_counts:
+                # Calculate consistency metrics
+                fill_rate = sum(fill_counts) / len(fill_counts)
+                type_consistency = 0
+                if data_types:
+                    non_empty_types = [t for t in data_types if t != 'empty']
+                    if non_empty_types:
+                        type_consistency = non_empty_types.count(non_empty_types[0]) / len(non_empty_types)
                 
-                return {
-                    'header_row': row_idx,
-                    'data_start': row_idx + 1,
-                    'data_columns': data_columns,
-                    'label_column': label_column,
-                    'method': 'fiscal_year_detection'
-                }
-        
-        return None
-    
-    # ============= DETECTION STRATEGY 5: Density-Based Detection =============
-    def detect_by_density(self, sheet) -> Optional[Dict]:
-        """Find regions with highest data density"""
-        density_scores = []
-        
-        for row_idx in range(min(50, sheet.max_row)):
-            non_empty_count = 0
-            for col_idx in range(1, min(sheet.max_column + 1, 20)):
-                if sheet.cell(row_idx + 1, col_idx).value is not None:
-                    non_empty_count += 1
-            density_scores.append(non_empty_count)
-        
-        # Find the first row with significant density
-        threshold = max(density_scores) * 0.6 if density_scores else 3
-        for i, score in enumerate(density_scores):
-            if score >= threshold and score >= 3:
-                # This could be header or data row
-                # Check next row to confirm
-                if i + 1 < len(density_scores) and density_scores[i + 1] >= threshold * 0.5:
-                    return {
-                        'header_row': i,
-                        'data_start': i + 1,
-                        'data_columns': list(range(1, min(sheet.max_column + 1, 20))),
-                        'method': 'density_detection'
+                # Column is consistent if:
+                # 1. Fill rate > 50% OR
+                # 2. Type consistency > 70%
+                if fill_rate > 0.5 or type_consistency > 0.7:
+                    col_consistency[col_idx] = {
+                        'fill_rate': fill_rate,
+                        'type_consistency': type_consistency,
+                        'score': (fill_rate + type_consistency) / 2
                     }
         
-        return None
-    
-    # ============= INTERACTIVE DETECTION (Fallback) =============
-    def interactive_detection(self, sheet_name: str) -> Dict:
-        """Let user manually specify table structure"""
-        print(f"\n{'='*60}")
-        print(f"Manual configuration required for sheet: {sheet_name}")
-        print(f"{'='*60}")
+        # Sort columns by consistency score and find contiguous blocks
+        if not col_consistency:
+            return []
         
-        # Display preview
-        print("\nPreview of first 20 rows and 15 columns:")
-        print("-" * 80)
-        for row_idx in range(min(20, self.wb[sheet_name].max_row)):
-            row_values = []
-            for col_idx in range(1, min(16, self.wb[sheet_name].max_column + 1)):
-                cell = self.wb[sheet_name].cell(row_idx + 1, col_idx).value
-                if cell:
-                    val = str(cell)[:15]
-                    row_values.append(f"{val:15}")
-                else:
-                    row_values.append(f"{'':15}")
-            print(f"Row {row_idx + 1:3}: " + " | ".join(row_values))
-        print("-" * 80)
+        # Find columns with high consistency
+        consistent_cols = [col for col, data in col_consistency.items() 
+                          if data['score'] >= self.consistency_threshold]
         
-        # Get configuration from user
-        config = {}
+        if not consistent_cols:
+            # Fallback: take columns with highest scores
+            sorted_cols = sorted(col_consistency.items(), key=lambda x: x[1]['score'], reverse=True)
+            consistent_cols = [col for col, _ in sorted_cols[:self.min_cols]]
         
-        while True:
-            try:
-                config['header_row'] = int(input("\nEnter header row number (1-indexed): ")) - 1
-                break
-            except:
-                print("Invalid input. Please enter a number.")
+        # Find contiguous column blocks
+        consistent_cols.sort()
+        col_blocks = []
+        current_block = [consistent_cols[0]]
         
-        while True:
-            try:
-                config['data_start'] = int(input("Enter first data row number (1-indexed): ")) - 1
-                break
-            except:
-                print("Invalid input. Please enter a number.")
-        
-        # Detect data end automatically or manually
-        auto_end = input("Auto-detect last data row? (y/n, default: y): ").lower() != 'n'
-        if not auto_end:
-            while True:
-                try:
-                    config['data_end'] = int(input("Enter last data row number (1-indexed): ")) - 1
-                    break
-                except:
-                    print("Invalid input. Please enter a number.")
-        
-        # Get label column
-        label_input = input("Enter label column (letter or number, default: A): ").strip()
-        if label_input:
-            if label_input.isalpha():
-                config['label_column'] = openpyxl.utils.column_index_from_string(label_input.upper())
+        for i in range(1, len(consistent_cols)):
+            if consistent_cols[i] == consistent_cols[i-1] + 1:
+                current_block.append(consistent_cols[i])
             else:
-                config['label_column'] = int(label_input)
-        else:
-            config['label_column'] = 1
+                if len(current_block) >= self.min_cols:
+                    col_blocks.append(current_block)
+                current_block = [consistent_cols[i]]
         
-        # Get data columns
-        cols_input = input("Enter data columns (comma-separated, e.g., 'C,D,E' or '3,4,5', default: auto): ").strip()
-        if cols_input:
-            config['data_columns'] = []
-            for col in cols_input.split(','):
-                col = col.strip()
-                if col.isalpha():
-                    config['data_columns'].append(openpyxl.utils.column_index_from_string(col.upper()))
-                else:
-                    config['data_columns'].append(int(col))
-        else:
-            # Auto-detect data columns from header row
-            config['data_columns'] = []
-            header_row = config['header_row']
-            for col_idx in range(1, min(self.wb[sheet_name].max_column + 1, 20)):
-                if self.wb[sheet_name].cell(header_row + 1, col_idx).value is not None:
-                    config['data_columns'].append(col_idx)
+        if len(current_block) >= self.min_cols:
+            col_blocks.append(current_block)
         
-        config['method'] = 'manual_input'
+        # Return the largest contiguous block
+        if col_blocks:
+            return max(col_blocks, key=len)
         
-        # Save for future use
-        self.save_config_to_file(sheet_name, config)
-        
-        return config
+        return consistent_cols[:self.min_cols] if consistent_cols else []
     
-    # ============= MAIN DETECTION ORCHESTRATOR =============
-    def detect_table_structure(self, sheet_name: str) -> Dict:
+    def find_consistent_row_blocks(self, sheet, col_range: range) -> List[DataBlock]:
         """
-        Try multiple detection strategies in order of reliability
-        Returns configuration dictionary with table structure
+        Find contiguous blocks of rows that have consistent data patterns
+        Handles gaps (empty rows) within blocks if they're small
         """
-        # Check if we have saved configuration for this sheet
-        file_key = os.path.basename(self.file_path)
-        if file_key in self.saved_configs and sheet_name in self.saved_configs[file_key]:
-            print(f"  ✓ Using saved configuration for {sheet_name}")
-            return self.saved_configs[file_key][sheet_name]
+        row_analyses = []
         
-        sheet = self.wb[sheet_name]
+        # Analyze each row
+        for row_idx in range(min(500, sheet.max_row)):
+            analysis = self.analyze_row_consistency(sheet, row_idx, col_range)
+            row_analyses.append(analysis)
         
-        # Define detection strategies in order of preference
-        strategies = [
-            ("Excel Table Object", self.detect_excel_table_object),
-            ("Fiscal Year Pattern", self.detect_fiscal_year_pattern),
-            ("Pattern Detection", self.detect_by_pattern),
-            ("Statistical Detection", self.detect_by_statistics),
-            ("Density Detection", self.detect_by_density),
-        ]
+        # Group rows into blocks based on consistency
+        blocks = []
+        current_block = []
+        consecutive_empty = 0
         
-        print(f"\n  Detecting table structure for '{sheet_name}'...")
-        
-        for strategy_name, strategy_func in strategies:
-            try:
-                result = strategy_func(sheet)
-                if result:
-                    print(f"  ✓ Success using {strategy_name}: {result['method']}")
-                    
-                    # Ensure we have data_start if not provided
-                    if 'data_start' not in result:
-                        result['data_start'] = result['header_row'] + 1
-                    
-                    # Ensure we have label_column if not provided
-                    if 'label_column' not in result:
-                        result['label_column'] = 1
-                    
-                    return result
-            except Exception as e:
-                print(f"  ✗ {strategy_name} failed: {str(e)}")
-                continue
-        
-        # If all automatic strategies fail, use interactive mode
-        print(f"  ⚠ All automatic detection strategies failed")
-        return self.interactive_detection(sheet_name)
-    
-    # ============= TABLE EXTRACTION =============
-    def extract_table(self, sheet_name: str) -> pd.DataFrame:
-        """
-        Extract table based on detected or user-provided configuration
-        """
-        if not self.wb:
-            self.load_workbook()
-        
-        sheet = self.wb[sheet_name]
-        
-        # Get table structure configuration
-        config = self.detect_table_structure(sheet_name)
-        
-        header_row = config['header_row']
-        data_start = config['data_start']
-        data_columns = config['data_columns']
-        label_column = config.get('label_column', 1)
-        
-        print(f"\n  Configuration:")
-        print(f"    - Header row: {header_row + 1}")
-        print(f"    - Data start: {data_start + 1}")
-        print(f"    - Label column: {label_column}")
-        print(f"    - Data columns: {data_columns}")
-        
-        # Extract headers
-        headers = []
-        for col_idx in data_columns:
-            header_cell = sheet.cell(header_row + 1, col_idx).value
-            if header_cell is None:
-                header_cell = f"Col_{col_idx}"
-            headers.append(str(header_cell).strip())
-        
-        # Determine data end if not specified
-        if 'data_end' in config:
-            data_end = config['data_end']
-        else:
-            # Auto-detect end of data
-            data_end = data_start
-            consecutive_empty = 0
-            for row_idx in range(data_start, min(data_start + 200, sheet.max_row)):
-                has_data = False
-                for col_idx in data_columns:
-                    if sheet.cell(row_idx + 1, col_idx).value is not None:
-                        has_data = True
-                        break
-                
-                if has_data:
-                    data_end = row_idx
+        for i, analysis in enumerate(row_analyses):
+            if analysis['has_data'] or (current_block and consecutive_empty < self.max_gap_rows):
+                # Start new block if needed
+                if not current_block and analysis['has_data']:
+                    current_block = [analysis]
+                    consecutive_empty = 0
+                elif current_block:
+                    # Check if this row is consistent with the block
+                    if self.is_row_consistent_with_block(analysis, current_block, col_range):
+                        current_block.append(analysis)
+                        consecutive_empty = 0 if analysis['has_data'] else consecutive_empty + 1
+                    else:
+                        # End current block and start new one
+                        if len(current_block) >= self.min_rows:
+                            blocks.append(self.create_block_from_rows(current_block, col_range))
+                        current_block = [analysis] if analysis['has_data'] else []
+                        consecutive_empty = 0 if analysis['has_data'] else 1
+            else:
+                # Empty row - might end the block
+                if current_block and consecutive_empty >= self.max_gap_rows:
+                    if len(current_block) >= self.min_rows:
+                        blocks.append(self.create_block_from_rows(current_block, col_range))
+                    current_block = []
                     consecutive_empty = 0
                 else:
                     consecutive_empty += 1
-                    if consecutive_empty >= 3:
-                        break
         
-        print(f"    - Data end: {data_end + 1} (auto-detected)")
+        # Add last block if exists
+        if current_block and len(current_block) >= self.min_rows:
+            blocks.append(self.create_block_from_rows(current_block, col_range))
         
-        # Extract row labels and data
-        row_labels = []
-        data_rows = []
+        return blocks
+    
+    def is_row_consistent_with_block(self, row_analysis: Dict, block_rows: List[Dict], col_range: range) -> bool:
+        """Check if a row is consistent with existing block"""
+        if not block_rows:
+            return True
         
-        for row_idx in range(data_start, data_end + 1):
-            # Get row label
-            label_cell = sheet.cell(row_idx + 1, label_column).value
-            if label_cell:
-                label = str(label_cell).strip()
-                # Clean up common prefixes
-                label = re.sub(r'^[A-Z]\*\d+\s*', '', label)
-                label = re.sub(r'^V\*\d+\s*', '', label)
-                row_labels.append(label if label else f"Row_{row_idx}")
-            else:
-                row_labels.append(f"Row_{row_idx}")
+        # Compare with typical row in block
+        typical_row = block_rows[-1]  # Use last row as reference
+        
+        # Check fill rate similarity
+        fill_rate_diff = abs(row_analysis['fill_rate'] - typical_row['fill_rate'])
+        
+        # Check if pattern is similar
+        if row_analysis['has_data']:
+            # For data rows, they should have similar fill rates
+            return fill_rate_diff < 0.3
+        else:
+            # For empty rows, only allow within max_gap_rows
+            return fill_rate_diff < 0.1
+    
+    def create_block_from_rows(self, rows: List[Dict], col_range: range) -> DataBlock:
+        """Create a DataBlock from a list of rows"""
+        start_row = rows[0]['row_idx']
+        end_row = rows[-1]['row_idx']
+        
+        # Calculate block consistency score
+        fill_rates = [r['fill_rate'] for r in rows if r['has_data']]
+        avg_fill_rate = sum(fill_rates) / len(fill_rates) if fill_rates else 0
+        
+        # Calculate row-to-row consistency
+        row_consistency = 1.0
+        if len(rows) > 1:
+            prev_fill = rows[0]['fill_rate']
+            diffs = []
+            for r in rows[1:]:
+                diffs.append(abs(r['fill_rate'] - prev_fill))
+                prev_fill = r['fill_rate']
+            row_consistency = 1 - (sum(diffs) / len(diffs)) if diffs else 1.0
+        
+        # Determine primary data type
+        all_types = []
+        for r in rows:
+            all_types.extend([t for t in r['data_types'] if t != 'empty'])
+        data_type = max(set(all_types), key=all_types.count) if all_types else 'mixed'
+        
+        return DataBlock(
+            start_row=start_row,
+            end_row=end_row,
+            start_col=col_range.start,
+            end_col=col_range.stop - 1,
+            consistency_score=avg_fill_rate * row_consistency,
+            data_type=data_type,
+            row_consistency=row_consistency,
+            col_consistency=1.0  # Will be updated later
+        )
+    
+    def merge_adjacent_blocks(self, blocks: List[DataBlock], sheet, col_range: range) -> List[DataBlock]:
+        """
+        Merge adjacent blocks that have similar column structure
+        (like the Assets and Liabilities sections in balance sheet)
+        """
+        if len(blocks) <= 1:
+            return blocks
+        
+        merged_blocks = []
+        current = blocks[0]
+        
+        for next_block in blocks[1:]:
+            # Check if blocks are adjacent or have small gap
+            gap = next_block.start_row - current.end_row - 1
             
-            # Get data values
-            row_data = []
-            for col_idx in data_columns:
-                cell_value = sheet.cell(row_idx + 1, col_idx).value
-                row_data.append(cell_value)
-            data_rows.append(row_data)
+            # Check if they share the same column structure
+            same_columns = (current.start_col == next_block.start_col and 
+                           current.end_col == next_block.end_col)
+            
+            # Check if data types are compatible
+            compatible_types = (current.data_type == next_block.data_type or
+                               current.data_type == 'numeric' or next_block.data_type == 'numeric')
+            
+            if gap <= self.max_gap_rows and same_columns and compatible_types:
+                # Merge blocks
+                current = DataBlock(
+                    start_row=current.start_row,
+                    end_row=next_block.end_row,
+                    start_col=current.start_col,
+                    end_col=current.end_col,
+                    consistency_score=(current.consistency_score + next_block.consistency_score) / 2,
+                    data_type=current.data_type if current.data_type == next_block.data_type else 'mixed',
+                    row_consistency=(current.row_consistency + next_block.row_consistency) / 2,
+                    col_consistency=(current.col_consistency + next_block.col_consistency) / 2
+                )
+            else:
+                merged_blocks.append(current)
+                current = next_block
         
-        # Create DataFrame
-        df = pd.DataFrame(data_rows, columns=headers)
-        df.index = row_labels
+        merged_blocks.append(current)
+        return merged_blocks
+    
+    def find_header_row(self, sheet, block: DataBlock, col_range: range) -> Optional[int]:
+        """
+        Find header row for a data block (looks for row immediately above with text)
+        """
+        header_candidates = []
+        
+        # Check rows above the block
+        for offset in range(1, 6):  # Check up to 5 rows above
+            header_row = block.start_row - offset
+            if header_row < 0:
+                break
+            
+            # Analyze potential header row
+            header_analysis = self.analyze_row_consistency(sheet, header_row, col_range)
+            
+            # Headers typically have:
+            # 1. Higher proportion of text
+            # 2. Lower fill rate than data rows
+            # 3. Different data type pattern
+            if (header_analysis['row_type'] == 'text_row' or 
+                (header_analysis['fill_rate'] > 0.3 and header_analysis['fill_rate'] < 0.8)):
+                header_candidates.append((header_row, header_analysis))
+        
+        if header_candidates:
+            # Return the closest candidate
+            return header_candidates[0][0]
+        
+        return None
+    
+    def extract_table(self, file_path: str, sheet_name: str) -> pd.DataFrame:
+        """
+        Extract table using consistency-based detection
+        """
+        # Load workbook
+        wb = openpyxl.load_workbook(file_path, data_only=True)
+        sheet = wb[sheet_name]
+        
+        print(f"\n🔍 Analyzing consistency patterns for '{sheet_name}'...")
+        
+        # Step 1: Find potential column range
+        # Start by analyzing first 50 rows to find consistent columns
+        initial_row_range = range(min(50, sheet.max_row))
+        
+        # Try different column ranges to find best fit
+        best_col_range = None
+        best_score = 0
+        
+        for start_col in range(1, min(sheet.max_column + 1, 15)):
+            for end_col in range(start_col + self.min_cols - 1, min(start_col + 10, sheet.max_column + 1)):
+                col_range = range(start_col, end_col + 1)
+                
+                # Check consistency across initial rows
+                consistent_cols = self.find_consistent_columns(sheet, 0, min(50, sheet.max_row) - 1)
+                
+                if consistent_cols and len(consistent_cols) >= self.min_cols:
+                    # Score this column range
+                    score = len(consistent_cols) / (end_col - start_col + 1)
+                    if score > best_score:
+                        best_score = score
+                        best_col_range = consistent_cols
+        
+        if not best_col_range:
+            # Fallback: use first N columns with data
+            for col_idx in range(1, min(sheet.max_column + 1, 10)):
+                has_data = False
+                for row_idx in range(min(20, sheet.max_row)):
+                    if sheet.cell(row_idx + 1, col_idx).value is not None:
+                        has_data = True
+                        break
+                if has_data and not best_col_range:
+                    best_col_range = [col_idx]
+                elif has_data and best_col_range and col_idx == best_col_range[-1] + 1:
+                    best_col_range.append(col_idx)
+                elif has_data and best_col_range:
+                    break
+        
+        if not best_col_range or len(best_col_range) < self.min_cols:
+            wb.close()
+            raise ValueError(f"Could not find consistent columns in sheet '{sheet_name}'")
+        
+        col_range = range(best_col_range[0], best_col_range[-1] + 1)
+        print(f"  📊 Detected column range: {get_column_letter(col_range.start)}-{get_column_letter(col_range.stop-1)}")
+        
+        # Step 2: Find consistent row blocks
+        row_blocks = self.find_consistent_row_blocks(sheet, col_range)
+        
+        if not row_blocks:
+            wb.close()
+            raise ValueError(f"No consistent row blocks found in sheet '{sheet_name}'")
+        
+        # Step 3: Merge adjacent blocks with same structure
+        merged_blocks = self.merge_adjacent_blocks(row_blocks, sheet, col_range)
+        
+        print(f"  📊 Found {len(merged_blocks)} consistent data block(s)")
+        for i, block in enumerate(merged_blocks):
+            print(f"    Block {i+1}: Rows {block.start_row+1}-{block.end_row+1}, "
+                  f"Consistency: {block.consistency_score:.2f}, Type: {block.data_type}")
+        
+        # Step 4: Extract all blocks into a single DataFrame
+        all_data = []
+        all_labels = []
+        header_row = None
+        
+        for block in merged_blocks:
+            # Find header for this block
+            block_header = self.find_header_row(sheet, block, col_range)
+            if block_header is not None and header_row is None:
+                header_row = block_header
+                print(f"  📌 Detected header row: {header_row + 1}")
+            
+            # Extract data from block
+            for row_idx in range(block.start_row, block.end_row + 1):
+                # Get row label (first column or column before data)
+                label_col = col_range.start - 1 if col_range.start > 1 else 1
+                label_cell = sheet.cell(row_idx + 1, label_col).value
+                
+                # Clean label
+                if label_cell:
+                    label = str(label_cell).strip()
+                    # Remove prefixes like "V*02", "V*03", etc.
+                    label = re.sub(r'^[A-Z]\*\d+\s*', '', label)
+                    label = re.sub(r'^V\*\d+\s*', '', label)
+                    all_labels.append(label if label else f"Row_{row_idx+1}")
+                else:
+                    all_labels.append(f"Row_{row_idx+1}")
+                
+                # Get data values
+                row_data = []
+                for col_idx in col_range:
+                    cell_value = sheet.cell(row_idx + 1, col_idx).value
+                    row_data.append(cell_value)
+                all_data.append(row_data)
+        
+        # Step 5: Extract headers
+        if header_row is not None:
+            headers = []
+            for col_idx in col_range:
+                header_cell = sheet.cell(header_row + 1, col_idx).value
+                if header_cell is None:
+                    header_cell = f"Col_{get_column_letter(col_idx)}"
+                headers.append(str(header_cell).strip())
+        else:
+            # Generate default headers
+            headers = [f"Column_{i+1}" for i in range(len(col_range))]
+        
+        # Step 6: Create DataFrame
+        df = pd.DataFrame(all_data, columns=headers)
+        df.index = all_labels
         df.index.name = 'Metric'
         
-        # Clean up: remove rows that are all NaN
+        # Step 7: Clean up
+        # Remove rows that are completely empty
         df = df.dropna(how='all')
         
         # Convert numeric columns
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='ignore')
         
+        # Remove columns that are completely empty
+        df = df.dropna(axis=1, how='all')
+        
+        wb.close()
+        
+        print(f"  ✅ Extracted table: {len(df)} rows × {len(df.columns)} columns")
+        
         return df
-    
-    # ============= MULTI-SECTION EXTRACTION (for sheets with Actual/Baseline) =============
-    def extract_multi_section_table(self, sheet_name: str) -> Dict[str, pd.DataFrame]:
-        """
-        Extract multiple sections from a sheet (e.g., Actual and Baseline sections)
-        """
-        if not self.wb:
-            self.load_workbook()
-        
-        sheet = self.wb[sheet_name]
-        results = {}
-        
-        # First, try to detect if there are multiple sections
-        fiscal_year_pattern = re.compile(r'FY\d{4}|20\d{2}')
-        header_rows = []
-        
-        for row_idx in range(min(30, sheet.max_row)):
-            has_fy = False
-            for col_idx in range(1, min(sheet.max_column + 1, 20)):
-                cell = sheet.cell(row_idx + 1, col_idx).value
-                if cell and fiscal_year_pattern.search(str(cell)):
-                    has_fy = True
-                    break
-            if has_fy:
-                header_rows.append(row_idx)
-        
-        if len(header_rows) > 1:
-            print(f"\n  Detected {len(header_rows)} potential sections")
-            
-            # Extract each section
-            for i, header_row in enumerate(header_rows):
-                section_name = f"Section_{i+1}"
-                
-                # Try to get section name from row above
-                if header_row > 0:
-                    section_cell = sheet.cell(header_row, 2).value  # Column B
-                    if section_cell and isinstance(section_cell, str):
-                        section_name = str(section_cell).strip()
-                
-                # Extract data for this section
-                config = {
-                    'header_row': header_row,
-                    'data_start': header_row + 1,
-                    'data_columns': [],
-                    'label_column': 2  # Column B typically has labels
-                }
-                
-                # Determine data columns from header row
-                for col_idx in range(1, min(sheet.max_column + 1, 20)):
-                    if sheet.cell(header_row + 1, col_idx).value is not None:
-                        config['data_columns'].append(col_idx)
-                
-                if config['data_columns']:
-                    # Temporarily set as current config
-                    original_config = self.detect_table_structure(sheet_name)
-                    
-                    # Extract this section
-                    df = self.extract_table_with_config(sheet_name, config)
-                    if not df.empty:
-                        results[section_name] = df
-                        print(f"    ✓ Extracted {section_name}: {len(df)} rows")
-        else:
-            # Single section - use normal extraction
-            df = self.extract_table(sheet_name)
-            if not df.empty:
-                results['Main'] = df
-        
-        return results
-    
-    def extract_table_with_config(self, sheet_name: str, config: Dict) -> pd.DataFrame:
-        """Extract table using provided configuration"""
-        sheet = self.wb[sheet_name]
-        
-        header_row = config['header_row']
-        data_start = config['data_start']
-        data_columns = config['data_columns']
-        label_column = config.get('label_column', 1)
-        
-        # Extract headers
-        headers = []
-        for col_idx in data_columns:
-            header_cell = sheet.cell(header_row + 1, col_idx).value
-            headers.append(str(header_cell).strip() if header_cell else f"Col_{col_idx}")
-        
-        # Extract data
-        row_labels = []
-        data_rows = []
-        
-        for row_idx in range(data_start, min(data_start + 100, sheet.max_row)):
-            # Check if row has data
-            has_data = any(sheet.cell(row_idx + 1, col_idx).value is not None for col_idx in data_columns)
-            
-            if not has_data and len(data_rows) > 0:
-                break
-            
-            if has_data:
-                # Get label
-                label_cell = sheet.cell(row_idx + 1, label_column).value
-                label = str(label_cell).strip() if label_cell else f"Row_{row_idx}"
-                label = re.sub(r'^[A-Z]\*\d+\s*', '', label)
-                row_labels.append(label)
-                
-                # Get data
-                row_data = [sheet.cell(row_idx + 1, col_idx).value for col_idx in data_columns]
-                data_rows.append(row_data)
-        
-        if data_rows:
-            df = pd.DataFrame(data_rows, columns=headers)
-            df.index = row_labels
-            df.index.name = 'Metric'
-            return df
-        
-        return pd.DataFrame()
-    
-    # ============= MAIN PUBLIC METHODS =============
-    def extract_all_tables(self, sheets_to_read: Optional[List[str]] = None, 
-                          multi_section: bool = True) -> Dict[str, Dict[str, pd.DataFrame]]:
-        """
-        Extract tables from all specified sheets
-        
-        Parameters:
-        - sheets_to_read: list of sheet names or indices (0-based)
-        - multi_section: whether to detect multiple sections within a sheet
-        
-        Returns:
-        - Dictionary: {sheet_name: {section_name: DataFrame}}
-        """
-        if not self.wb:
-            self.load_workbook()
-        
-        results = {}
-        
-        # Determine which sheets to process
-        all_sheets = self.wb.sheetnames
-        
-        if sheets_to_read is None:
-            sheets_to_process = all_sheets
-        else:
-            sheets_to_process = []
-            for sheet in sheets_to_read:
-                if isinstance(sheet, int) and 0 <= sheet < len(all_sheets):
-                    sheets_to_process.append(all_sheets[sheet])
-                elif sheet in all_sheets:
-                    sheets_to_process.append(sheet)
-        
-        for sheet_name in sheets_to_process:
-            try:
-                print(f"\n{'='*80}")
-                print(f"Processing sheet: {sheet_name}")
-                print(f"{'='*80}")
-                
-                if multi_section:
-                    sheet_results = self.extract_multi_section_table(sheet_name)
-                else:
-                    df = self.extract_table(sheet_name)
-                    sheet_results = {'Main': df} if not df.empty else {}
-                
-                if sheet_results:
-                    results[sheet_name] = sheet_results
-                    
-                    for section_name, df in sheet_results.items():
-                        print(f"\n  ✓ {section_name}: {len(df)} rows × {len(df.columns)} columns")
-                        print(f"    Columns: {list(df.columns)}")
-                        print(f"\n    Preview:")
-                        print(df.head(8))
-                else:
-                    print(f"  ⚠ No data extracted")
-                    
-            except Exception as e:
-                print(f"  ✗ Error: {str(e)}")
-                import traceback
-                traceback.print_exc()
-        
-        return results
-    
-    def save_tables(self, tables: Dict[str, Dict[str, pd.DataFrame]], 
-                   output_path: str = 'extracted_tables', 
-                   format: str = 'excel'):
-        """
-        Save extracted tables to file
-        
-        Parameters:
-        - tables: dictionary of extracted tables
-        - output_path: base path for output files
-        - format: 'excel' or 'csv'
-        """
-        if format == 'excel':
-            with pd.ExcelWriter(f"{output_path}.xlsx", engine='openpyxl') as writer:
-                for sheet_name, sections in tables.items():
-                    for section_name, df in sections.items():
-                        # Create valid sheet name (max 31 chars)
-                        sheet_title = f"{sheet_name}_{section_name}"[:31]
-                        sheet_title = sheet_title.replace('/', '_').replace('\\', '_').replace(':', '_')
-                        df.to_excel(writer, sheet_name=sheet_title)
-            
-            print(f"\n✓ Saved all tables to {output_path}.xlsx")
-        
-        elif format == 'csv':
-            for sheet_name, sections in tables.items():
-                for section_name, df in sections.items():
-                    filename = f"{output_path}_{sheet_name}_{section_name}.csv"
-                    filename = filename.replace(' ', '_').replace('/', '_')
-                    df.to_csv(filename)
-                    print(f"✓ Saved {filename}")
-    
-    def get_summary(self, tables: Dict[str, Dict[str, pd.DataFrame]]):
-        """Print summary of extracted tables"""
-        print("\n" + "="*80)
-        print("EXTRACTION SUMMARY")
-        print("="*80)
-        
-        total_tables = 0
-        total_rows = 0
-        
-        for sheet_name, sections in tables.items():
-            print(f"\n📊 {sheet_name}")
-            for section_name, df in sections.items():
-                total_tables += 1
-                total_rows += len(df)
-                print(f"   └─ {section_name}: {len(df)} rows, {len(df.columns)} columns")
-        
-        print(f"\n✅ Total: {total_tables} tables, {total_rows} rows extracted")
-        print(f"💾 Configuration saved to: {self.config_file}")
 
-# ============= USAGE EXAMPLE =============
+# Example usage with your specific scenario
 if __name__ == "__main__":
+    # Initialize detector
+    detector = ConsistencyBasedDetector(
+        min_rows=2,           # Minimum 2 rows for a table
+        min_cols=2,           # Minimum 2 columns
+        consistency_threshold=0.7,  # 70% consistency required
+        max_gap_rows=1        # Allow 1 empty row within table
+    )
+    
+    # Extract table
     file_path = "Dummy_Financials.xlsx"
     
-    # Initialize extractor
-    extractor = SmartExcelTableExtractor(file_path, config_file='table_config.json')
-    
+    # For Income Statement
+    print("\n" + "="*80)
+    print("EXTRACTING INCOME STATEMENT")
+    print("="*80)
     try:
-        # Extract all tables with multi-section detection
-        tables = extractor.extract_all_tables(multi_section=True)
+        df_income = detector.extract_table(file_path, "Income Statement")
+        print("\n📊 Extracted Income Statement:")
+        print(df_income)
+        print(f"\nShape: {df_income.shape}")
         
-        # Display summary
-        extractor.get_summary(tables)
+        # Save to CSV
+        df_income.to_csv("income_statement_consistency_based.csv")
+        print("\n✓ Saved to income_statement_consistency_based.csv")
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    # For Balance Sheet
+    print("\n" + "="*80)
+    print("EXTRACTING BALANCE SHEET")
+    print("="*80)
+    try:
+        df_balance = detector.extract_table(file_path, "Balance Sheet")
+        print("\n📊 Extracted Balance Sheet:")
+        print(df_balance)
+        print(f"\nShape: {df_balance.shape}")
         
-        # Save results
-        if tables:
-            extractor.save_tables(tables, output_path='extracted_financials', format='excel')
-            extractor.save_tables(tables, output_path='extracted_financials', format='csv')
-        
-    finally:
-        extractor.close_workbook()
+        # Save to CSV
+        df_balance.to_csv("balance_sheet_consistency_based.csv")
+        print("\n✓ Saved to balance_sheet_consistency_based.csv")
+    except Exception as e:
+        print(f"Error: {e}")
