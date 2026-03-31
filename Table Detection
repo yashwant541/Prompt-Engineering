@@ -3,8 +3,9 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 import re
 from typing import List, Dict, Optional, Tuple, Any
+from collections import defaultdict
 
-class AdvancedExcelTableExtractor:
+class ComplexExcelTableExtractor:
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.wb = None
@@ -18,95 +19,103 @@ class AdvancedExcelTableExtractor:
         if self.wb:
             self.wb.close()
     
-    def find_header_row_and_columns(self, sheet) -> Tuple[int, List[int], int]:
+    def find_multi_level_headers(self, sheet) -> Tuple[List[int], Dict[int, List[int]], Dict[int, str]]:
         """
-        Find header row, data columns, and label column.
-        Returns (header_row_index, data_columns_list, label_column_index)
+        Find multi-level headers and group them by section.
+        Returns: (header_rows, {section_start_col: data_columns}, {col: header_text})
         """
         fiscal_year_pattern = re.compile(r'FY\d{4}|20\d{2}')
+        header_rows = []
         
-        # First, find the header row (contains fiscal years)
-        header_row_idx = None
-        data_columns = []
-        
-        for row_idx in range(min(20, sheet.max_row)):
-            fiscal_years_found = []
-            potential_data_cols = []
-            
+        # First, find all rows that contain fiscal years
+        for row_idx in range(min(30, sheet.max_row)):
+            has_fiscal_years = False
             for col_idx in range(1, min(sheet.max_column + 1, 20)):
                 cell_value = sheet.cell(row_idx + 1, col_idx).value
                 if cell_value is not None:
                     cell_str = str(cell_value).strip()
-                    
-                    # Check for fiscal year patterns
                     if fiscal_year_pattern.search(cell_str) or (cell_str.isdigit() and len(cell_str) == 4 and int(cell_str) >= 2000):
-                        fiscal_years_found.append((col_idx, cell_str))
-                        potential_data_cols.append(col_idx)
+                        has_fiscal_years = True
+                        break
+            if has_fiscal_years:
+                header_rows.append(row_idx)
+        
+        # Group columns by sections (based on empty columns)
+        sections = {}
+        current_section_start = 1
+        section_headers = {}
+        
+        if header_rows:
+            # Use the first header row to determine column grouping
+            header_row_idx = header_rows[0]
             
-            # If we found at least 3 fiscal years, this is our header row
-            if len(fiscal_years_found) >= 3:
-                header_row_idx = row_idx
-                data_columns = potential_data_cols
-                break
-        
-        if header_row_idx is None:
-            # Fallback: find row with most numeric-looking values
-            max_score = 0
-            for row_idx in range(min(20, sheet.max_row)):
-                score = 0
-                potential_cols = []
-                for col_idx in range(1, min(sheet.max_column + 1, 20)):
-                    cell_value = sheet.cell(row_idx + 1, col_idx).value
-                    if cell_value is not None:
-                        cell_str = str(cell_value).strip()
-                        if re.match(r'\d{4}', cell_str):
-                            score += 2
-                            potential_cols.append(col_idx)
-                        elif cell_str.replace(',', '').replace('.', '').isdigit():
-                            score += 1
-                if score > max_score:
-                    max_score = score
-                    header_row_idx = row_idx
-                    data_columns = potential_cols
-        
-        # Find label column (where row descriptions are stored)
-        label_column = None
-        if header_row_idx is not None:
-            # Check columns to the left of data columns
-            min_data_col = min(data_columns) if data_columns else 1
-            for col_idx in range(1, min_data_col):
-                # Check if this column has text values
-                text_count = 0
-                for row_idx in range(header_row_idx + 1, min(header_row_idx + 30, sheet.max_row)):
-                    cell_value = sheet.cell(row_idx + 1, col_idx).value
-                    if cell_value is not None and str(cell_value).strip():
-                        cell_str = str(cell_value).strip()
-                        # If it's not purely numeric, it might be a label
-                        if not cell_str.replace(',', '').replace('.', '').isdigit():
-                            text_count += 1
-                
-                if text_count > 3:  # Found multiple text entries
-                    label_column = col_idx
-                    break
+            for col_idx in range(1, min(sheet.max_column + 1, 20)):
+                cell_value = sheet.cell(header_row_idx + 1, col_idx).value
+                if cell_value is None or str(cell_value).strip() == '':
+                    # Empty column might indicate section break
+                    if col_idx > current_section_start:
+                        sections[current_section_start] = list(range(current_section_start, col_idx))
+                    current_section_start = col_idx + 1
+                else:
+                    # Store header text
+                    section_headers[col_idx] = str(cell_value).strip()
             
-            # If no label column found, use the first column before data columns
-            if label_column is None and min_data_col > 1:
-                label_column = min_data_col - 1
+            # Add the last section
+            if current_section_start <= sheet.max_column:
+                sections[current_section_start] = list(range(current_section_start, min(sheet.max_column + 1, 20)))
         
-        return header_row_idx, data_columns, label_column
+        return header_rows, sections, section_headers
     
-    def extract_continuous_table(self, sheet, header_row_idx: int, data_columns: List[int], 
-                                 label_column: int, start_row: int) -> Tuple[List[str], List[List[Any]], int]:
+    def extract_row_labels(self, sheet, data_start_row: int, data_end_row: int, 
+                          label_column: int = 1) -> List[str]:
         """
-        Extract a continuous block of table data starting from start_row
-        Returns (row_labels, data_rows, last_row_processed)
+        Extract row labels from the specified column
         """
-        row_labels = []
+        labels = []
+        for row_idx in range(data_start_row, data_end_row + 1):
+            cell_value = sheet.cell(row_idx + 1, label_column).value
+            if cell_value is not None:
+                label = str(cell_value).strip()
+                # Clean up labels - remove prefixes like "V*02" if they exist
+                label = re.sub(r'^V\*\d+\s*', '', label)
+                labels.append(label if label else f"Row_{row_idx}")
+            else:
+                labels.append(f"Row_{row_idx}")
+        return labels
+    
+    def extract_section_data(self, sheet, header_row_idx: int, data_columns: List[int],
+                            start_row: int, section_name: str = "") -> Tuple[pd.DataFrame, int]:
+        """
+        Extract data for a specific section (e.g., Actual or Baseline)
+        """
+        # Extract headers for this section
+        headers = []
+        for col_idx in data_columns:
+            header_cell = sheet.cell(header_row_idx + 1, col_idx).value
+            if header_cell is None:
+                header_cell = f"Col_{col_idx}"
+            headers.append(f"{section_name}_{str(header_cell).strip()}" if section_name else str(header_cell).strip())
+        
+        # Find where data starts
+        data_start = start_row
+        while data_start < sheet.max_row:
+            has_data = False
+            for col_idx in data_columns:
+                cell_value = sheet.cell(data_start + 1, col_idx).value
+                if cell_value is not None and str(cell_value).strip():
+                    has_data = True
+                    break
+            if has_data:
+                break
+            data_start += 1
+        
+        # Extract data
         data_rows = []
-        current_row = start_row
+        row_labels = []
+        current_row = data_start
         
         while current_row < sheet.max_row:
-            # Check if this row has any data in the data columns
+            # Check if this row has data in any of the data columns
             has_data = False
             row_values = []
             
@@ -118,157 +127,99 @@ class AdvancedExcelTableExtractor:
                 else:
                     row_values.append(None)
             
-            # Get label if available
-            label = None
-            if label_column and label_column > 0:
-                label_cell = sheet.cell(current_row + 1, label_column).value
-                if label_cell is not None:
-                    label = str(label_cell).strip()
+            # Get row label from column A or B
+            label_cell = sheet.cell(current_row + 1, 1).value  # Column A
+            if label_cell is None or not str(label_cell).strip():
+                label_cell = sheet.cell(current_row + 1, 2).value  # Column B
             
-            # If this row has data, add it
             if has_data:
-                if label:
+                if label_cell:
+                    label = str(label_cell).strip()
+                    # Clean up label
+                    label = re.sub(r'^V\*\d+\s*', '', label)
                     row_labels.append(label)
                 else:
-                    row_labels.append(f"Row_{len(row_labels) + 1}")
+                    row_labels.append(f"Row_{current_row}")
                 data_rows.append(row_values)
                 current_row += 1
             else:
-                # Check if we've hit the end of this table section
-                # If we found a blank row and we've already collected data, break
+                # If we've collected data and hit an empty row, stop this section
                 if len(data_rows) > 0:
-                    # Check if next row might be a new section header
-                    next_row_has_fiscal_years = False
-                    if current_row + 1 < sheet.max_row:
-                        for col_idx in data_columns:
-                            next_cell = sheet.cell(current_row + 2, col_idx).value
-                            if next_cell is not None:
-                                next_str = str(next_cell).strip()
-                                if re.match(r'FY\d{4}|20\d{2}', next_str):
-                                    next_row_has_fiscal_years = True
-                                    break
-                    
-                    # If next row has fiscal years, we've reached a new section header
-                    if next_row_has_fiscal_years:
-                        break
-                    # Otherwise, it's just a separator, continue to next row
-                    else:
-                        current_row += 1
-                else:
-                    current_row += 1
+                    break
+                current_row += 1
         
-        return row_labels, data_rows, current_row
+        if data_rows:
+            df = pd.DataFrame(data_rows, columns=headers)
+            df.index = row_labels
+            df.index.name = 'Metric'
+            return df, current_row
+        
+        return pd.DataFrame(), current_row
     
-    def extract_table(self, sheet_name: str, header_row: Optional[int] = None) -> pd.DataFrame:
+    def extract_table(self, sheet_name: str) -> Dict[str, pd.DataFrame]:
         """
-        Extract table from a specific sheet, handling multiple sections
+        Extract table from a specific sheet, handling multiple sections (Actual vs Baseline)
         """
         if not self.wb:
             self.load_workbook()
         
         sheet = self.wb[sheet_name]
         
-        # Find header row and columns
-        if header_row is None:
-            header_row_idx, data_columns, label_column = self.find_header_row_and_columns(sheet)
-        else:
-            header_row_idx = header_row - 1
-            # Determine data columns from header row
-            data_columns = []
-            for col_idx in range(1, min(sheet.max_column + 1, 20)):
-                cell_value = sheet.cell(header_row_idx + 1, col_idx).value
-                if cell_value is not None:
-                    data_columns.append(col_idx)
-            # Find label column
-            label_column = None
-            min_data_col = min(data_columns) if data_columns else 1
-            for col_idx in range(1, min_data_col):
-                if sheet.cell(header_row_idx + 2, col_idx).value is not None:
-                    label_column = col_idx
-                    break
+        # Find header rows and sections
+        header_rows, sections, section_headers = self.find_multi_level_headers(sheet)
         
-        print(f"  Header row: {header_row_idx + 1}")
-        print(f"  Data columns: {data_columns}")
-        print(f"  Label column: {label_column + 1 if label_column else 'Not found'}")
+        print(f"  Found header rows at: {[h+1 for h in header_rows]}")
+        print(f"  Found sections: {sections}")
         
-        if not data_columns:
-            raise ValueError(f"No data columns found in sheet '{sheet_name}'")
+        if not header_rows:
+            raise ValueError(f"No header rows found in sheet '{sheet_name}'")
         
-        # Extract headers
-        headers = []
-        for col_idx in data_columns:
-            header_cell = sheet.cell(header_row_idx + 1, col_idx).value
-            if header_cell is None:
-                header_cell = f"Year_{col_idx}"
-            headers.append(str(header_cell).strip())
+        # Determine section names (Actual, Baseline, etc.)
+        section_names = {}
+        for col_idx, header_text in section_headers.items():
+            # Look for section indicators like "Actual" or "Baseline"
+            if 'actual' in header_text.lower():
+                for start_col, cols in sections.items():
+                    if col_idx in cols:
+                        section_names[start_col] = 'Actual'
+            elif 'baseline' in header_text.lower():
+                for start_col, cols in sections.items():
+                    if col_idx in cols:
+                        section_names[start_col] = 'Baseline'
         
-        # Find where data starts (after header row)
-        data_start_row = header_row_idx + 1
-        while data_start_row < sheet.max_row:
-            has_data = False
-            for col_idx in data_columns:
-                cell_value = sheet.cell(data_start_row + 1, col_idx).value
-                if cell_value is not None and str(cell_value).strip():
-                    has_data = True
-                    break
-            if has_data:
-                break
-            data_start_row += 1
+        # Extract each section
+        results = {}
+        data_start_row = max(header_rows) + 1
         
-        # Extract all table sections
-        all_row_labels = []
-        all_data_rows = []
-        current_row = data_start_row
-        
-        # Keep extracting until we've processed all data rows
-        while current_row < sheet.max_row:
-            labels, rows, next_row = self.extract_continuous_table(
-                sheet, header_row_idx, data_columns, label_column, current_row
-            )
+        for start_col, cols in sections.items():
+            section_name = section_names.get(start_col, f"Section_{start_col}")
+            print(f"\n  Extracting section: {section_name} (Columns: {cols})")
             
-            if rows:  # If we found data in this section
-                all_row_labels.extend(labels)
-                all_data_rows.extend(rows)
+            # Use the appropriate header row (if multiple, use the one with years)
+            header_row_idx = header_rows[-1] if header_rows else header_rows[0]
             
-            current_row = next_row + 1  # Move to next row after the processed section
+            df, last_row = self.extract_section_data(sheet, header_row_idx, cols, 
+                                                     data_start_row, section_name)
             
-            # If we've reached the end or next row is beyond sheet, break
-            if current_row >= sheet.max_row:
-                break
-            
-            # Check if we've hit a new section with its own sub-header
-            next_cell = sheet.cell(current_row + 1, data_columns[0]).value if data_columns else None
-            if next_cell and str(next_cell).strip() and re.match(r'FY\d{4}|20\d{2}', str(next_cell).strip()):
-                # This is a new section header, update header_row_idx
-                header_row_idx = current_row
-                # Update headers if needed
-                new_headers = []
-                for col_idx in data_columns:
-                    header_cell = sheet.cell(header_row_idx + 1, col_idx).value
-                    if header_cell:
-                        new_headers.append(str(header_cell).strip())
-                if new_headers:
-                    headers = new_headers
-                current_row += 1
+            if not df.empty:
+                results[section_name] = df
+                print(f"    ✓ Extracted {len(df)} rows")
+                data_start_row = last_row
+            else:
+                print(f"    ⚠ No data found")
         
-        # Create DataFrame
-        df = pd.DataFrame(all_data_rows, columns=headers)
+        # If we have both Actual and Baseline, merge them
+        if 'Actual' in results and 'Baseline' in results:
+            print("\n  Merging Actual and Baseline sections...")
+            merged_df = pd.concat([results['Actual'], results['Baseline']], axis=1)
+            # Remove duplicate index names if any
+            merged_df = merged_df.loc[~merged_df.index.duplicated(keep='first')]
+            results['Combined'] = merged_df
+            print(f"    ✓ Created combined table with {len(merged_df)} rows and {len(merged_df.columns)} columns")
         
-        # Add row labels as index
-        if all_row_labels:
-            df.index = all_row_labels
-            df.index.name = 'Metric'
-        
-        # Clean up: remove completely empty rows
-        df = df.dropna(how='all')
-        
-        # Convert numeric columns
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='ignore')
-        
-        return df
+        return results
     
-    def extract_all_tables(self, sheets_to_read: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+    def extract_all_tables(self, sheets_to_read: Optional[List[str]] = None) -> Dict[str, Dict[str, pd.DataFrame]]:
         """
         Extract tables from specified sheets or all sheets
         """
@@ -284,18 +235,20 @@ class AdvancedExcelTableExtractor:
         for sheet_name in sheets_to_read:
             if sheet_name in self.wb.sheetnames:
                 try:
-                    print(f"\n{'='*60}")
+                    print(f"\n{'='*80}")
                     print(f"Processing sheet: {sheet_name}")
-                    print(f"{'='*60}")
-                    df = self.extract_table(sheet_name)
+                    print(f"{'='*80}")
                     
-                    if not df.empty:
-                        results[sheet_name] = df
-                        print(f"\n✓ Successfully extracted table:")
-                        print(f"  - {len(df)} rows")
-                        print(f"  - {len(df.columns)} columns: {list(df.columns)}")
-                        print(f"\nPreview:")
-                        print(df.head(10))
+                    sheet_results = self.extract_table(sheet_name)
+                    
+                    if sheet_results:
+                        results[sheet_name] = sheet_results
+                        
+                        # Display preview
+                        for section_name, df in sheet_results.items():
+                            print(f"\n  {section_name} Section Preview:")
+                            print(df.head(8))
+                            print(f"  Shape: {df.shape}")
                     else:
                         print(f"⚠ No data extracted from sheet '{sheet_name}'")
                         
@@ -306,50 +259,45 @@ class AdvancedExcelTableExtractor:
         
         return results
     
-    def save_tables(self, tables: Dict[str, pd.DataFrame], output_format: str = 'excel', 
-                   output_path: str = 'extracted_tables'):
+    def save_tables(self, tables: Dict[str, Dict[str, pd.DataFrame]], output_path: str = 'extracted_tables'):
         """
-        Save extracted tables to file(s)
+        Save extracted tables to Excel file with multiple sheets
         """
-        if output_format == 'excel':
-            with pd.ExcelWriter(f"{output_path}.xlsx", engine='openpyxl') as writer:
-                for sheet_name, df in tables.items():
-                    clean_name = sheet_name[:31].replace('/', '_').replace('\\', '_')
-                    df.to_excel(writer, sheet_name=clean_name)
-            print(f"\n✓ Saved all tables to {output_path}.xlsx")
+        with pd.ExcelWriter(f"{output_path}.xlsx", engine='openpyxl') as writer:
+            for sheet_name, sections in tables.items():
+                for section_name, df in sections.items():
+                    # Create sheet name
+                    sheet_title = f"{sheet_name}_{section_name}"[:31]
+                    sheet_title = sheet_title.replace('/', '_').replace('\\', '_').replace(':', '_')
+                    df.to_excel(writer, sheet_name=sheet_title)
         
-        elif output_format == 'csv':
-            for sheet_name, df in tables.items():
-                clean_name = sheet_name.replace(' ', '_').replace('/', '_').replace('\\', '_')
-                filename = f"{output_path}_{clean_name}.csv"
-                df.to_csv(filename)
-                print(f"✓ Saved {filename}")
+        print(f"\n✓ Saved all tables to {output_path}.xlsx")
 
 # Example usage
 if __name__ == "__main__":
     file_path = "Dummy_Financials.xlsx"
     
     # Create extractor
-    extractor = AdvancedExcelTableExtractor(file_path)
+    extractor = ComplexExcelTableExtractor(file_path)
     
     try:
         # Extract all tables
-        tables = extractor.extract_all_tables()
+        all_tables = extractor.extract_all_tables()
         
         # Display detailed results
-        for sheet_name, df in tables.items():
+        for sheet_name, sections in all_tables.items():
             print(f"\n{'='*80}")
-            print(f"Final Table: {sheet_name}")
+            print(f"Final Results for: {sheet_name}")
             print(f"{'='*80}")
-            print(df.to_string())
-            print(f"\nShape: {df.shape}")
+            
+            for section_name, df in sections.items():
+                print(f"\n--- {section_name} ---")
+                print(df.to_string())
+                print(f"\nShape: {df.shape}")
         
         # Save to Excel
-        if tables:
-            extractor.save_tables(tables, output_format='excel', output_path='extracted_financials')
-            
-            # Also save as CSV for individual files
-            extractor.save_tables(tables, output_format='csv', output_path='extracted_financials')
+        if all_tables:
+            extractor.save_tables(all_tables, output_path='extracted_financials')
         
     finally:
         extractor.close_workbook()
