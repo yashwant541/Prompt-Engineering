@@ -1,0 +1,2406 @@
+import pandas as pd
+import openpyxl
+from openpyxl.utils import get_column_letter, column_index_from_string
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Any, Set
+import re
+from datetime import datetime
+from dataclasses import dataclass, field
+from enum import Enum
+import json
+from collections import defaultdict, Counter
+import warnings
+import os
+import traceback
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+class TableType(Enum):
+    """Types of tables that can be detected"""
+    FINANCIAL_STATEMENT = "financial_statement"
+    PIVOT_TABLE = "pivot_table"
+    RAW_DATA = "raw_data"
+    HIERARCHICAL = "hierarchical"
+    CROSS_TAB = "cross_tabulation"
+    MULTI_LEVEL_HEADER = "multi_level_header"
+    MULTI_LEVEL_LABEL = "multi_level_label"
+    UNKNOWN = "unknown"
+
+@dataclass
+class CellRange:
+    """Represents a cell range in Excel"""
+    start_row: int
+    end_row: int
+    start_col: int
+    end_col: int
+    
+    def to_excel_range(self) -> str:
+        """Convert to Excel range notation (e.g., 'A1:B10')"""
+        start_cell = f"{get_column_letter(self.start_col)}{self.start_row}"
+        end_cell = f"{get_column_letter(self.end_col)}{self.end_row}"
+        return f"{start_cell}:{end_cell}"
+    
+    def __str__(self):
+        return self.to_excel_range()
+
+@dataclass
+class TableStructure:
+    """Represents the detected structure of a table"""
+    header_rows: List[int] = field(default_factory=list)
+    data_start_row: int = 0
+    data_end_row: int = 0
+    data_columns: List[int] = field(default_factory=list)
+    label_columns: List[int] = field(default_factory=list)  # Changed to list for multiple label columns
+    has_merged_headers: bool = False
+    multi_section: bool = False
+    sections: Dict[str, Dict] = field(default_factory=dict)
+    confidence_score: float = 0.0
+    table_type: TableType = TableType.UNKNOWN
+    header_levels: List[str] = field(default_factory=list)
+    label_hierarchy: Dict[int, str] = field(default_factory=dict)  # Column index -> hierarchy level name
+    
+    def get_header_range(self) -> CellRange:
+        """Get the cell range for headers"""
+        if not self.header_rows or not self.data_columns:
+            return None
+        
+        min_row = min(self.header_rows)
+        max_row = max(self.header_rows)
+        min_col = min(self.data_columns)
+        max_col = max(self.data_columns)
+        
+        return CellRange(min_row, max_row, min_col, max_col)
+    
+    def get_data_range(self) -> CellRange:
+        """Get the cell range for data"""
+        if not self.data_start_row or not self.data_end_row or not self.data_columns:
+            return None
+        
+        min_col = min(self.data_columns)
+        max_col = max(self.data_columns)
+        
+        return CellRange(self.data_start_row, self.data_end_row, min_col, max_col)
+    
+    def get_label_range(self) -> CellRange:
+        """Get the cell range for labels"""
+        if not self.data_start_row or not self.data_end_row or not self.label_columns:
+            return None
+        
+        min_col = min(self.label_columns)
+        max_col = max(self.label_columns)
+        
+        return CellRange(self.data_start_row, self.data_end_row, min_col, max_col)
+    
+    def get_label_hierarchy_str(self) -> str:
+        """Get string representation of label hierarchy"""
+        if not self.label_columns:
+            return "None"
+        
+        hierarchy = []
+        for col in self.label_columns:
+            level_name = self.label_hierarchy.get(col, f"Level_{len(hierarchy)+1}")
+            hierarchy.append(f"{level_name} (Col {get_column_letter(col)})")
+        
+        return " → ".join(hierarchy)
+
+@dataclass
+class ColumnProfile:
+    """Profile of a column in the sheet"""
+    index: int
+    letter: str
+    sample_values: List[str]
+    data_type: str
+    fill_rate: float
+    is_numeric: bool
+    is_date: bool
+    is_header_candidate: bool
+    is_data_candidate: bool
+    business_meaning: str
+    pattern_score: float
+    is_label_candidate: bool = False
+    label_hierarchy_level: int = 0
+
+@dataclass
+class ExtractionSuggestion:
+    """Suggestion for table extraction"""
+    name: str
+    description: str
+    confidence: float
+    structure: TableStructure
+    preview: pd.DataFrame
+    pros: List[str]
+    cons: List[str]
+
+# ============================================================================
+# MULTI-LEVEL HEADER AND LABEL PROCESSOR
+# ============================================================================
+
+class MultiLevelProcessor:
+    """Process multi-level headers and labels"""
+    
+    def __init__(self, sheet):
+        self.sheet = sheet
+    
+    def detect_multi_level_labels(self, data_start: int, data_end: int, 
+                                  max_label_cols: int = 5) -> Tuple[List[int], Dict[int, str]]:
+        """
+        Detect multi-level label columns (like Category, Subcategory, Metric)
+        Returns: (list of label columns, dict of column -> hierarchy level name)
+        """
+        label_columns = []
+        label_hierarchy = {}
+        
+        # Check columns to the left of potential data
+        for col_idx in range(1, max_label_cols + 1):
+            # Analyze this column for label characteristics
+            text_count = 0
+            numeric_count = 0
+            unique_values = set()
+            empty_count = 0
+            
+            for row_idx in range(data_start, min(data_end + 1, data_start + 50)):
+                cell = self.sheet.cell(row_idx, col_idx)
+                if cell.value:
+                    val_str = str(cell.value).strip()
+                    unique_values.add(val_str)
+                    
+                    # Check if it's text (likely a label)
+                    if isinstance(cell.value, str) and not re.match(r'[\d\.]+', val_str):
+                        text_count += 1
+                    elif isinstance(cell.value, (int, float)):
+                        numeric_count += 1
+                else:
+                    empty_count += 1
+            
+            total_checked = text_count + numeric_count + empty_count
+            fill_rate = (text_count + numeric_count) / total_checked if total_checked > 0 else 0
+            text_ratio = text_count / (text_count + numeric_count) if (text_count + numeric_count) > 0 else 0
+            
+            # Column is a good label candidate if:
+            # 1. High fill rate (> 40%)
+            # 2. Mostly text (> 70% text)
+            # 3. Not too many unique values (not a data column)
+            if fill_rate > 0.4 and text_ratio > 0.7:
+                label_columns.append(col_idx)
+                
+                # Determine hierarchy level based on position and content
+                if col_idx == 1:
+                    hierarchy_level = "Category"
+                elif col_idx == 2:
+                    hierarchy_level = "Subcategory"
+                else:
+                    hierarchy_level = f"Level_{len(label_columns)}"
+                
+                label_hierarchy[col_idx] = hierarchy_level
+        
+        # If no labels found, try to detect from patterns
+        if not label_columns:
+            # Look for columns with repeating text patterns
+            for col_idx in range(1, max_label_cols + 1):
+                pattern_detected = self.detect_label_pattern(col_idx, data_start, data_end)
+                if pattern_detected:
+                    label_columns.append(col_idx)
+                    label_hierarchy[col_idx] = f"Label_{col_idx}"
+        
+        return label_columns, label_hierarchy
+    
+    def detect_label_pattern(self, col_idx: int, data_start: int, data_end: int) -> bool:
+        """Detect if column has label-like patterns (repeating categories)"""
+        values = []
+        for row_idx in range(data_start, min(data_end + 1, data_start + 30)):
+            cell = self.sheet.cell(row_idx, col_idx)
+            if cell.value:
+                values.append(str(cell.value).strip())
+        
+        if len(values) < 3:
+            return False
+        
+        # Check for repeating patterns (like sections in financial statements)
+        unique_values = set(values)
+        repeat_ratio = len(values) / len(unique_values) if unique_values else 0
+        
+        # If values repeat frequently, it's likely a label column
+        if repeat_ratio > 2.0:
+            return True
+        
+        # Check if values look like categories
+        category_keywords = ['assets', 'liabilities', 'equity', 'income', 'expense', 'total']
+        if any(keyword in ' '.join(values).lower() for keyword in category_keywords):
+            return True
+        
+        return False
+    
+    def merge_multi_level_labels(self, label_columns: List[int], 
+                                 data_start: int, data_end: int) -> Tuple[List[str], List[str]]:
+        """
+        Merge multiple label columns into hierarchical index
+        Returns: (list of merged labels, list of individual label columns names)
+        """
+        if not label_columns:
+            return [], []
+        
+        merged_labels = []
+        column_names = []
+        
+        # Get column names for labels (from first data row or header)
+        for col_idx in label_columns:
+            # Try to find column name from header rows
+            col_name = None
+            for row_idx in range(1, min(data_start, 6)):
+                cell = self.sheet.cell(row_idx, col_idx)
+                if cell.value:
+                    col_name = str(cell.value).strip()
+                    break
+            
+            if not col_name:
+                col_name = f"Level_{get_column_letter(col_idx)}"
+            
+            column_names.append(col_name)
+        
+        # Merge labels for each data row
+        for row_idx in range(data_start, data_end + 1):
+            label_parts = []
+            for col_idx in label_columns:
+                cell = self.sheet.cell(row_idx, col_idx)
+                if cell.value:
+                    label_parts.append(str(cell.value).strip())
+                else:
+                    label_parts.append("")
+            
+            # Create hierarchical label
+            if label_parts:
+                # Remove empty parts and join
+                non_empty_parts = [p for p in label_parts if p]
+                if non_empty_parts:
+                    merged_label = " → ".join(non_empty_parts)
+                else:
+                    merged_label = f"Row_{row_idx}"
+            else:
+                merged_label = f"Row_{row_idx}"
+            
+            merged_labels.append(merged_label)
+        
+        return merged_labels, column_names
+    
+    def merge_multi_level_headers(self, header_rows: List[int], data_columns: List[int]) -> List[str]:
+        """Merge multi-level headers into single header strings"""
+        if len(header_rows) <= 1:
+            return None
+        
+        sorted_header_rows = sorted(header_rows)
+        
+        # Extract all header levels
+        header_levels = []
+        for row_idx in sorted_header_rows:
+            level = []
+            for col_idx in data_columns:
+                cell = self.sheet.cell(row_idx, col_idx)
+                if cell.value:
+                    level.append(str(cell.value).strip())
+                else:
+                    # Check for merged cells that span multiple columns
+                    merged_value = self.get_merged_header_value(row_idx, col_idx, data_columns)
+                    level.append(merged_value)
+            header_levels.append(level)
+        
+        # Merge headers from different levels
+        merged_headers = []
+        for col_idx in range(len(data_columns)):
+            header_parts = []
+            
+            for level_idx, level in enumerate(header_levels):
+                if col_idx < len(level) and level[col_idx]:
+                    header_parts.append(level[col_idx])
+            
+            if header_parts:
+                merged = self.intelligently_merge_headers(header_parts)
+                merged_headers.append(merged)
+            else:
+                merged_headers.append(f"Column_{get_column_letter(data_columns[col_idx])}")
+        
+        return merged_headers
+    
+    def get_merged_header_value(self, row_idx: int, col_idx: int, data_columns: List[int]) -> str:
+        """Get value from merged cell that spans multiple columns"""
+        cell = self.sheet.cell(row_idx, col_idx)
+        
+        for merged_range in self.sheet.merged_cells.ranges:
+            if cell.coordinate in merged_range:
+                top_left = self.sheet.cell(merged_range.min_row, merged_range.min_col)
+                if top_left.value:
+                    return str(top_left.value).strip()
+        
+        return None
+    
+    def intelligently_merge_headers(self, header_parts: List[str]) -> str:
+        """Intelligently merge header parts with appropriate formatting"""
+        if not header_parts:
+            return ""
+        
+        header_parts = [h for h in header_parts if h]
+        
+        if len(header_parts) == 1:
+            return header_parts[0]
+        
+        # Special case: Check if this looks like "Actual" + "FY2022"
+        if len(header_parts) == 2:
+            if re.match(r'FY\d{4}|20\d{2}', header_parts[1]):
+                return f"{header_parts[0]}_{header_parts[1]}"
+            
+            if any(word in header_parts[0].lower() for word in ['actual', 'baseline', 'forecast', 'budget']):
+                return f"{header_parts[0]}_{header_parts[1]}"
+        
+        # General case: join with underscore
+        return "_".join(header_parts)
+    
+    def detect_section_headers(self, header_rows: List[int], data_columns: List[int]) -> Dict[str, List[int]]:
+        """Detect section headers like 'Actual' and 'Baseline' that span multiple columns"""
+        if not header_rows:
+            return {}
+        
+        sections = {}
+        first_header_row = min(header_rows)
+        
+        current_section = None
+        section_start_col = None
+        
+        for col_idx in data_columns:
+            cell = self.sheet.cell(first_header_row, col_idx)
+            if cell.value:
+                cell_value = str(cell.value).strip()
+                
+                if any(keyword in cell_value.lower() for keyword in ['actual', 'baseline', 'forecast', 'budget']):
+                    if current_section:
+                        sections[current_section] = list(range(section_start_col, col_idx))
+                    current_section = cell_value
+                    section_start_col = col_idx
+        
+        if current_section and section_start_col:
+            sections[current_section] = list(range(section_start_col, data_columns[-1] + 1))
+        
+        return sections
+
+# ============================================================================
+# SMART ANALYZER ENGINE
+# ============================================================================
+
+class SmartAnalyzer:
+    """Advanced analyzer that understands table structures"""
+    
+    def __init__(self, sheet, max_rows_analysis: int = 100, max_cols_analysis: int = 30):
+        self.sheet = sheet
+        self.max_rows = min(max_rows_analysis, sheet.max_row)
+        self.max_cols = min(max_cols_analysis, sheet.max_column)
+        self.cache = {}
+        self.multi_processor = MultiLevelProcessor(sheet)
+    
+    def analyze_sheet(self) -> Dict:
+        """Perform comprehensive analysis of the sheet"""
+        print("\n🔍 Analyzing sheet structure...")
+        
+        analysis = {
+            'dimensions': self.analyze_dimensions(),
+            'density_map': self.analyze_density(),
+            'column_profiles': self.analyze_columns(),
+            'row_profiles': self.analyze_rows(),
+            'merged_cells': self.analyze_merged_cells(),
+            'patterns': self.analyze_patterns(),
+            'data_types': self.analyze_data_types(),
+            'structure_hints': self.analyze_structure_hints()
+        }
+        
+        total_cells = analysis['dimensions']['total_cells']
+        print(f"✓ Analysis complete: {total_cells} cells analyzed")
+        return analysis
+    
+    def analyze_dimensions(self) -> Dict:
+        """Analyze sheet dimensions"""
+        return {
+            'total_rows': self.sheet.max_row,
+            'total_cols': self.sheet.max_column,
+            'used_rows': self.get_used_row_count(),
+            'used_cols': self.get_used_col_count(),
+            'density': self.calculate_overall_density(),
+            'total_cells': self.sheet.max_row * self.sheet.max_column
+        }
+    
+    def analyze_density(self) -> Dict:
+        """Analyze data density in the sheet"""
+        density_map = []
+        for row_idx in range(1, min(50, self.sheet.max_row + 1)):
+            row_density = []
+            for col_idx in range(1, min(30, self.sheet.max_column + 1)):
+                if self.sheet.cell(row_idx, col_idx).value is not None:
+                    row_density.append(1)
+                else:
+                    row_density.append(0)
+            density_map.append(row_density)
+        
+        flat_density = [cell for row in density_map for cell in row]
+        total_cells = len(flat_density)
+        filled_cells = sum(flat_density)
+        
+        return {
+            'map': density_map,
+            'shape': (len(density_map), len(density_map[0]) if density_map else 0),
+            'overall_density': filled_cells / total_cells if total_cells > 0 else 0,
+            'filled_cells': filled_cells,
+            'total_cells': total_cells
+        }
+    
+    def get_used_row_count(self) -> int:
+        """Get number of rows with any data"""
+        used = 0
+        for row_idx in range(1, min(500, self.sheet.max_row + 1)):
+            for col_idx in range(1, min(20, self.sheet.max_column + 1)):
+                if self.sheet.cell(row_idx, col_idx).value is not None:
+                    used += 1
+                    break
+        return used
+    
+    def get_used_col_count(self) -> int:
+        """Get number of columns with any data"""
+        used = 0
+        for col_idx in range(1, min(50, self.sheet.max_column + 1)):
+            for row_idx in range(1, min(100, self.sheet.max_row + 1)):
+                if self.sheet.cell(row_idx, col_idx).value is not None:
+                    used += 1
+                    break
+        return used
+    
+    def calculate_overall_density(self) -> float:
+        """Calculate overall data density"""
+        total_cells = 0
+        filled_cells = 0
+        
+        for row_idx in range(1, min(100, self.sheet.max_row + 1)):
+            for col_idx in range(1, min(20, self.sheet.max_column + 1)):
+                total_cells += 1
+                if self.sheet.cell(row_idx, col_idx).value is not None:
+                    filled_cells += 1
+        
+        return filled_cells / total_cells if total_cells > 0 else 0
+    
+    def analyze_columns(self) -> List[ColumnProfile]:
+        """Create detailed profiles for each column"""
+        profiles = []
+        
+        for col_idx in range(1, self.max_cols + 1):
+            col_letter = get_column_letter(col_idx)
+            values = []
+            numeric_count = 0
+            text_count = 0
+            date_count = 0
+            empty_count = 0
+            
+            sample_values = []
+            for row_idx in range(1, min(20, self.max_rows + 1)):
+                cell = self.sheet.cell(row_idx, col_idx)
+                value = cell.value
+                if value is not None and str(value).strip():
+                    values.append(value)
+                    sample_values.append(str(value)[:30])
+                    
+                    if isinstance(value, (int, float)):
+                        numeric_count += 1
+                    elif isinstance(value, str):
+                        if re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', value):
+                            date_count += 1
+                            sample_values[-1] = f"[DATE] {value}"
+                        else:
+                            text_count += 1
+                else:
+                    empty_count += 1
+            
+            total = len(values) + empty_count
+            fill_rate = len(values) / total if total > 0 else 0
+            
+            if numeric_count > text_count and numeric_count > date_count:
+                data_type = 'numeric'
+                is_numeric = True
+                is_date = False
+            elif date_count > text_count:
+                data_type = 'date'
+                is_numeric = False
+                is_date = True
+            elif text_count > 0:
+                data_type = 'text'
+                is_numeric = False
+                is_date = False
+            else:
+                data_type = 'empty'
+                is_numeric = False
+                is_date = False
+            
+            is_header_candidate = self.is_header_column(col_idx, data_type, values)
+            is_data_candidate = not is_header_candidate and fill_rate > 0.3
+            business_meaning = self.infer_business_meaning(col_idx, data_type, values)
+            pattern_score = self.calculate_column_pattern_score(col_idx, values)
+            
+            profiles.append(ColumnProfile(
+                index=col_idx,
+                letter=col_letter,
+                sample_values=sample_values[:5],
+                data_type=data_type,
+                fill_rate=fill_rate,
+                is_numeric=is_numeric,
+                is_date=is_date,
+                is_header_candidate=is_header_candidate,
+                is_data_candidate=is_data_candidate,
+                business_meaning=business_meaning,
+                pattern_score=pattern_score
+            ))
+        
+        return profiles
+    
+    def is_header_column(self, col_idx: int, data_type: str, values: List) -> bool:
+        """Check if column looks like headers"""
+        for val in values[:10]:
+            val_str = str(val)
+            if re.search(r'FY\d{4}|20\d{2}', val_str):
+                return True
+        
+        text_count = sum(1 for v in values if isinstance(v, str) and not re.match(r'[\d\.]+', v))
+        if len(values) > 0 and text_count / len(values) > 0.7:
+            return True
+        
+        return False
+    
+    def infer_business_meaning(self, col_idx: int, data_type: str, values: List) -> str:
+        """Infer business meaning from column content"""
+        if not values:
+            return "unknown"
+        
+        header_text = ""
+        for row_idx in range(1, min(5, self.max_rows + 1)):
+            cell = self.sheet.cell(row_idx, col_idx)
+            if cell.value:
+                header_text += str(cell.value).lower() + " "
+        
+        term_map = {
+            'revenue': ['revenue', 'income', 'sales', 'turnover'],
+            'expense': ['expense', 'cost', 'spending', 'overhead'],
+            'profit': ['profit', 'earnings', 'margin', 'net'],
+            'asset': ['asset', 'property', 'equipment', 'inventory'],
+            'liability': ['liability', 'debt', 'loan', 'payable'],
+            'equity': ['equity', 'capital', 'reserve', 'share'],
+            'date': ['date', 'year', 'month', 'quarter', 'fy'],
+            'percentage': ['%', 'percent', 'rate'],
+            'quantity': ['qty', 'count', 'units', 'volume']
+        }
+        
+        for meaning, keywords in term_map.items():
+            if any(keyword in header_text for keyword in keywords):
+                return meaning
+        
+        if data_type == 'numeric':
+            return 'numeric_value'
+        elif data_type == 'date':
+            return 'date'
+        elif data_type == 'text':
+            sample_str = ' '.join([str(v).lower() for v in values[:5]])
+            for meaning, keywords in term_map.items():
+                if any(keyword in sample_str for keyword in keywords):
+                    return meaning
+        
+        return "unknown"
+    
+    def calculate_column_pattern_score(self, col_idx: int, values: List) -> float:
+        """Calculate how well column follows a pattern"""
+        if len(values) < 3:
+            return 0.0
+        
+        score = 0
+        
+        formats = []
+        for v in values[:20]:
+            if isinstance(v, (int, float)):
+                formats.append('numeric')
+            elif isinstance(v, str):
+                if v.isdigit():
+                    formats.append('digit_string')
+                elif re.match(r'[\d,]+\.?\d*', v):
+                    formats.append('formatted_number')
+                else:
+                    formats.append('text')
+        
+        if formats:
+            most_common = Counter(formats).most_common(1)[0]
+            score += most_common[1] / len(formats) * 0.5
+        
+        if len(values) >= 3:
+            numeric_values = []
+            for v in values[:10]:
+                try:
+                    num = float(v) if isinstance(v, (int, float)) else float(re.sub(r'[^\d\.-]', '', str(v)))
+                    numeric_values.append(num)
+                except:
+                    pass
+            
+            if len(numeric_values) >= 3:
+                diffs = [numeric_values[i+1] - numeric_values[i] for i in range(len(numeric_values)-1)]
+                if diffs and all(abs(d - diffs[0]) < 0.1 for d in diffs):
+                    score += 0.3
+        
+        return min(score, 1.0)
+    
+    def analyze_rows(self) -> List[Dict]:
+        """Analyze row patterns"""
+        row_profiles = []
+        
+        for row_idx in range(1, min(50, self.max_rows + 1)):
+            values = []
+            data_types = []
+            merged_info = []
+            
+            for col_idx in range(1, self.max_cols + 1):
+                cell = self.sheet.cell(row_idx, col_idx)
+                value = cell.value
+                values.append(value)
+                
+                is_merged = False
+                for merged_range in self.sheet.merged_cells.ranges:
+                    if cell.coordinate in merged_range:
+                        is_merged = True
+                        merged_info.append(merged_range)
+                        break
+                
+                if value is not None:
+                    if isinstance(value, (int, float)):
+                        data_types.append('numeric')
+                    elif isinstance(value, str):
+                        if re.match(r'FY\d{4}|20\d{2}', value):
+                            data_types.append('fiscal_year')
+                        else:
+                            data_types.append('text')
+                else:
+                    data_types.append('empty')
+            
+            non_empty = sum(1 for v in values if v is not None)
+            fill_rate = non_empty / len(values) if values else 0
+            
+            if fill_rate > 0.7 and 'fiscal_year' in data_types:
+                row_type = 'header_row'
+                confidence = 0.9
+            elif fill_rate > 0.5 and 'numeric' in data_types:
+                row_type = 'data_row'
+                confidence = 0.8
+            elif fill_rate < 0.2:
+                row_type = 'empty_row'
+                confidence = 0.9
+            elif fill_rate > 0.3 and 'text' in data_types:
+                row_type = 'label_row'
+                confidence = 0.7
+            else:
+                row_type = 'mixed_row'
+                confidence = 0.5
+            
+            row_profiles.append({
+                'row_idx': row_idx,
+                'non_empty': non_empty,
+                'fill_rate': fill_rate,
+                'data_types': data_types,
+                'row_type': row_type,
+                'confidence': confidence,
+                'has_merged': len(merged_info) > 0
+            })
+        
+        return row_profiles
+    
+    def analyze_merged_cells(self) -> Dict:
+        """Analyze merged cell patterns"""
+        merged_info = {
+            'count': len(self.sheet.merged_cells.ranges),
+            'ranges': [],
+            'header_candidates': []
+        }
+        
+        for merged_range in self.sheet.merged_cells.ranges:
+            merged_info['ranges'].append({
+                'min_row': merged_range.min_row,
+                'max_row': merged_range.max_row,
+                'min_col': merged_range.min_col,
+                'max_col': merged_range.max_col,
+                'size_rows': merged_range.max_row - merged_range.min_row + 1,
+                'size_cols': merged_range.max_col - merged_range.min_col + 1
+            })
+            
+            if merged_range.min_row <= 5:
+                merged_info['header_candidates'].append(merged_range)
+        
+        return merged_info
+    
+    def analyze_patterns(self) -> Dict:
+        """Detect patterns in the sheet"""
+        patterns = {
+            'fiscal_years': [],
+            'totals': [],
+            'section_headers': [],
+            'empty_separators': []
+        }
+        
+        for row_idx in range(1, self.max_rows + 1):
+            row_text = []
+            for col_idx in range(1, min(10, self.max_cols + 1)):
+                cell = self.sheet.cell(row_idx, col_idx)
+                if cell.value:
+                    row_text.append(str(cell.value).lower())
+            
+            row_text_str = ' '.join(row_text)
+            
+            if re.search(r'fy\d{4}|20\d{2}', row_text_str):
+                patterns['fiscal_years'].append(row_idx)
+            
+            if re.search(r'total|sum|合计', row_text_str):
+                patterns['totals'].append(row_idx)
+            
+            if re.search(r'^(assets|liabilities|equity|income|expense)', row_text_str):
+                patterns['section_headers'].append(row_idx)
+        
+        for row_idx in range(1, self.max_rows + 1):
+            empty_count = 0
+            for col_idx in range(1, self.max_cols + 1):
+                if self.sheet.cell(row_idx, col_idx).value is None:
+                    empty_count += 1
+            
+            if empty_count > self.max_cols * 0.8:
+                patterns['empty_separators'].append(row_idx)
+        
+        return patterns
+    
+    def analyze_data_types(self) -> Dict:
+        """Analyze data type distribution"""
+        type_distribution = {
+            'numeric': 0,
+            'text': 0,
+            'date': 0,
+            'empty': 0,
+            'fiscal_year': 0
+        }
+        
+        for row_idx in range(1, min(100, self.max_rows + 1)):
+            for col_idx in range(1, min(20, self.max_cols + 1)):
+                cell = self.sheet.cell(row_idx, col_idx)
+                if cell.value is None:
+                    type_distribution['empty'] += 1
+                elif isinstance(cell.value, (int, float)):
+                    type_distribution['numeric'] += 1
+                elif isinstance(cell.value, str):
+                    if re.match(r'FY\d{4}|20\d{2}', cell.value):
+                        type_distribution['fiscal_year'] += 1
+                    elif re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', cell.value):
+                        type_distribution['date'] += 1
+                    else:
+                        type_distribution['text'] += 1
+        
+        return type_distribution
+    
+    def analyze_structure_hints(self) -> Dict:
+        """Find structural hints that indicate table boundaries"""
+        hints = {
+            'possible_headers': [],
+            'possible_data_starts': [],
+            'possible_tables': []
+        }
+        
+        row_profiles = self.analyze_rows()
+        
+        for profile in row_profiles:
+            if profile['row_type'] == 'header_row' and profile['confidence'] > 0.7:
+                hints['possible_headers'].append(profile['row_idx'])
+        
+        for i, profile in enumerate(row_profiles):
+            if i > 0 and profile['row_type'] == 'data_row':
+                prev_profile = row_profiles[i-1]
+                if prev_profile['row_type'] in ['empty_row', 'header_row']:
+                    hints['possible_data_starts'].append(profile['row_idx'])
+        
+        return hints
+
+# ============================================================================
+# SUGGESTION ENGINE WITH MULTI-LEVEL LABEL SUPPORT
+# ============================================================================
+
+class SuggestionEngine:
+    """Generates intelligent suggestions for table extraction"""
+    
+    def __init__(self, analyzer: SmartAnalyzer):
+        self.analyzer = analyzer
+        self.analysis = analyzer.analyze_sheet()
+        self.processor = MultiLevelProcessor(analyzer.sheet)
+    
+    def generate_suggestions(self) -> List[ExtractionSuggestion]:
+        """Generate multiple extraction suggestions"""
+        suggestions = []
+        
+        standard = self.suggest_standard_table()
+        if standard:
+            suggestions.append(standard)
+        
+        multi_level_header = self.suggest_multi_level_table()
+        if multi_level_header:
+            suggestions.append(multi_level_header)
+        
+        multi_level_labels = self.suggest_multi_level_labels()
+        if multi_level_labels:
+            suggestions.append(multi_level_labels)
+        
+        financial = self.suggest_financial_statement()
+        if financial:
+            suggestions.append(financial)
+        
+        simple = self.suggest_simple_range()
+        if simple:
+            suggestions.append(simple)
+        
+        suggestions.sort(key=lambda x: x.confidence, reverse=True)
+        
+        return suggestions
+    
+    def suggest_multi_level_labels(self) -> Optional[ExtractionSuggestion]:
+        """Suggest table with multi-level labels (hierarchical row structure)"""
+        print("\n  📊 Analyzing multi-level label pattern...")
+        
+        # Find header rows
+        header_candidates = []
+        for profile in self.analysis['row_profiles']:
+            if profile['row_type'] == 'header_row' and profile['confidence'] > 0.6:
+                header_candidates.append(profile['row_idx'])
+        
+        if not header_candidates:
+            return None
+        
+        header_row = header_candidates[0]
+        
+        # Find data columns
+        data_columns = []
+        for col_profile in self.analysis['column_profiles']:
+            if col_profile.is_data_candidate and col_profile.fill_rate > 0.3:
+                data_columns.append(col_profile.index)
+        
+        if not data_columns:
+            return None
+        
+        # Find data start
+        data_start = header_row + 1
+        for profile in self.analysis['row_profiles']:
+            if profile['row_idx'] > header_row and profile['row_type'] in ['data_row', 'label_row']:
+                data_start = profile['row_idx']
+                break
+        
+        # Find data end
+        data_end = data_start
+        for profile in self.analysis['row_profiles']:
+            if profile['row_idx'] > data_start and profile['row_type'] == 'empty_row':
+                break
+            if profile['row_type'] in ['data_row', 'label_row']:
+                data_end = profile['row_idx']
+        
+        # Detect multi-level labels
+        label_columns, label_hierarchy = self.processor.detect_multi_level_labels(data_start, data_end)
+        
+        if not label_columns:
+            # If no multi-level labels, use single label column
+            label_columns = [self.find_label_column(data_columns)]
+            label_hierarchy = {label_columns[0]: "Metric"}
+        
+        # Merge multi-level headers if multiple header rows exist
+        if len(header_candidates) > 1:
+            headers = self.processor.merge_multi_level_headers(header_candidates, data_columns)
+            header_rows = header_candidates
+        else:
+            headers = []
+            for col_idx in data_columns:
+                header_cell = self.analyzer.sheet.cell(header_row, col_idx)
+                if header_cell.value:
+                    headers.append(str(header_cell.value).strip())
+                else:
+                    headers.append(f"Col_{get_column_letter(col_idx)}")
+            header_rows = [header_row]
+        
+        # Extract preview with multi-level labels
+        preview = self.extract_preview_with_multilevel_labels(
+            headers, data_start, data_end, data_columns, label_columns
+        )
+        
+        if preview is None or len(preview) < 2:
+            return None
+        
+        confidence = 0.88
+        
+        structure = TableStructure(
+            header_rows=header_rows,
+            data_start_row=data_start,
+            data_end_row=data_end,
+            data_columns=data_columns,
+            label_columns=label_columns,
+            label_hierarchy=label_hierarchy,
+            has_merged_headers=len(self.analysis['merged_cells']['header_candidates']) > 0,
+            multi_section=False,
+            confidence_score=confidence,
+            table_type=TableType.MULTI_LEVEL_LABEL
+        )
+        
+        return ExtractionSuggestion(
+            name="Multi-Level Labels (Hierarchical Rows)",
+            description="Table with hierarchical row structure using multiple label columns",
+            confidence=confidence,
+            structure=structure,
+            preview=preview,
+            pros=["Preserves hierarchical row structure", "Handles categories and subcategories", "Clean multi-level indexing"],
+            cons=["More complex index structure", "May need verification for hierarchy levels"]
+        )
+    
+    def suggest_multi_level_table(self) -> Optional[ExtractionSuggestion]:
+        """Suggest table with multi-level headers"""
+        print("\n  📊 Analyzing multi-level header pattern...")
+        
+        # Find potential header rows
+        header_candidates = []
+        for profile in self.analysis['row_profiles']:
+            if profile['row_type'] in ['header_row', 'label_row'] and profile['fill_rate'] > 0.4:
+                header_candidates.append(profile['row_idx'])
+        
+        if len(header_candidates) < 2:
+            return None
+        
+        # Find consecutive header rows
+        header_groups = []
+        current_group = [header_candidates[0]]
+        
+        for i in range(1, len(header_candidates)):
+            if header_candidates[i] == header_candidates[i-1] + 1:
+                current_group.append(header_candidates[i])
+            else:
+                if len(current_group) >= 2:
+                    header_groups.append(current_group)
+                current_group = [header_candidates[i]]
+        
+        if len(current_group) >= 2:
+            header_groups.append(current_group)
+        
+        if not header_groups:
+            return None
+        
+        header_rows = header_groups[0]
+        
+        # Find data columns
+        data_columns = []
+        for col_idx in range(1, self.analyzer.max_cols + 1):
+            numeric_count = 0
+            check_rows = range(max(header_rows) + 2, min(max(header_rows) + 10, self.analyzer.max_rows + 1))
+            for row_idx in check_rows:
+                cell = self.analyzer.sheet.cell(row_idx, col_idx)
+                if isinstance(cell.value, (int, float)):
+                    numeric_count += 1
+            
+            if numeric_count >= 3:
+                data_columns.append(col_idx)
+        
+        if not data_columns:
+            return None
+        
+        # Find data start
+        data_start = max(header_rows) + 1
+        for row_idx in range(max(header_rows) + 1, min(max(header_rows) + 20, self.analyzer.max_rows + 1)):
+            has_numeric = False
+            for col_idx in data_columns:
+                cell = self.analyzer.sheet.cell(row_idx, col_idx)
+                if isinstance(cell.value, (int, float)):
+                    has_numeric = True
+                    break
+            if has_numeric:
+                data_start = row_idx
+                break
+        
+        # Find data end
+        data_end = data_start
+        consecutive_empty = 0
+        for row_idx in range(data_start, min(data_start + 500, self.analyzer.max_rows + 1)):
+            has_data = False
+            for col_idx in data_columns:
+                if self.analyzer.sheet.cell(row_idx, col_idx).value is not None:
+                    has_data = True
+                    break
+            
+            if has_data:
+                data_end = row_idx
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+        
+        # Detect label columns
+        label_columns, label_hierarchy = self.processor.detect_multi_level_labels(data_start, data_end)
+        
+        if not label_columns:
+            label_columns = [self.find_label_column(data_columns)]
+            label_hierarchy = {label_columns[0]: "Metric"}
+        
+        # Merge multi-level headers
+        merged_headers = self.processor.merge_multi_level_headers(header_rows, data_columns)
+        
+        # Extract preview
+        preview = self.extract_preview_with_multilevel_labels(
+            merged_headers, data_start, data_end, data_columns, label_columns
+        )
+        
+        if preview is None or len(preview) < 2:
+            return None
+        
+        # Detect sections
+        sections = self.processor.detect_section_headers(header_rows, data_columns)
+        
+        structure = TableStructure(
+            header_rows=header_rows,
+            data_start_row=data_start,
+            data_end_row=data_end,
+            data_columns=data_columns,
+            label_columns=label_columns,
+            label_hierarchy=label_hierarchy,
+            has_merged_headers=len(self.analysis['merged_cells']['header_candidates']) > 0,
+            multi_section=len(sections) > 0,
+            sections=sections,
+            confidence_score=0.9,
+            table_type=TableType.MULTI_LEVEL_HEADER
+        )
+        
+        return ExtractionSuggestion(
+            name="Multi-Level Table (Headers & Labels)",
+            description="Table with multi-level headers and hierarchical row labels",
+            confidence=0.9,
+            structure=structure,
+            preview=preview,
+            pros=["Handles complex structures", "Preserves both header and row hierarchy", "Complete data extraction"],
+            cons=["Complex structure", "May need verification"]
+        )
+    
+    def suggest_standard_table(self) -> Optional[ExtractionSuggestion]:
+        """Suggest standard table structure"""
+        print("\n  📊 Analyzing standard table pattern...")
+        
+        header_candidates = []
+        for profile in self.analysis['row_profiles']:
+            if profile['row_type'] == 'header_row' and profile['confidence'] > 0.6:
+                header_candidates.append(profile['row_idx'])
+        
+        if not header_candidates:
+            return None
+        
+        header_row = header_candidates[0]
+        
+        data_columns = []
+        for col_profile in self.analysis['column_profiles']:
+            if col_profile.is_data_candidate and col_profile.fill_rate > 0.3:
+                data_columns.append(col_profile.index)
+        
+        if not data_columns:
+            return None
+        
+        data_start = header_row + 1
+        for profile in self.analysis['row_profiles']:
+            if profile['row_idx'] > header_row and profile['row_type'] in ['data_row', 'label_row']:
+                data_start = profile['row_idx']
+                break
+        
+        data_end = data_start
+        for profile in self.analysis['row_profiles']:
+            if profile['row_idx'] > data_start and profile['row_type'] == 'empty_row':
+                break
+            if profile['row_type'] in ['data_row', 'label_row']:
+                data_end = profile['row_idx']
+        
+        # Detect label columns
+        label_columns, label_hierarchy = self.processor.detect_multi_level_labels(data_start, data_end)
+        
+        if not label_columns:
+            label_columns = [self.find_label_column(data_columns)]
+            label_hierarchy = {label_columns[0]: "Metric"}
+        
+        # Extract headers
+        headers = []
+        for col_idx in data_columns:
+            header_cell = self.analyzer.sheet.cell(header_row, col_idx)
+            if header_cell.value:
+                headers.append(str(header_cell.value).strip())
+            else:
+                headers.append(f"Col_{get_column_letter(col_idx)}")
+        
+        preview = self.extract_preview_with_multilevel_labels(
+            headers, data_start, data_end, data_columns, label_columns
+        )
+        
+        if preview is None or len(preview) < 2:
+            return None
+        
+        confidence = self.calculate_table_confidence(header_row, data_columns, preview)
+        
+        structure = TableStructure(
+            header_rows=[header_row],
+            data_start_row=data_start,
+            data_end_row=data_end,
+            data_columns=data_columns,
+            label_columns=label_columns,
+            label_hierarchy=label_hierarchy,
+            has_merged_headers=len(self.analysis['merged_cells']['header_candidates']) > 0,
+            multi_section=False,
+            confidence_score=confidence,
+            table_type=TableType.RAW_DATA
+        )
+        
+        return ExtractionSuggestion(
+            name="Standard Table",
+            description="Standard table structure with single header row",
+            confidence=confidence,
+            structure=structure,
+            preview=preview,
+            pros=["Simple structure", "Easy to extract", "Well-aligned data"],
+            cons=["May not handle multi-level headers or labels"]
+        )
+    
+    def suggest_financial_statement(self) -> Optional[ExtractionSuggestion]:
+        """Suggest financial statement structure (with sections)"""
+        print("\n  💰 Analyzing financial statement pattern...")
+        
+        fiscal_years = self.analysis['patterns']['fiscal_years']
+        sections = self.analysis['patterns']['section_headers']
+        
+        if len(fiscal_years) < 2:
+            return None
+        
+        header_row = fiscal_years[0]
+        
+        data_columns = []
+        for col_idx in range(1, self.analyzer.max_cols + 1):
+            for row_idx in fiscal_years[:3]:
+                cell = self.analyzer.sheet.cell(row_idx, col_idx)
+                if cell.value and re.search(r'FY\d{4}|20\d{2}', str(cell.value)):
+                    data_columns.append(col_idx)
+                    break
+        
+        if not data_columns:
+            return None
+        
+        sections_dict = {}
+        current_section = None
+        
+        for profile in self.analysis['row_profiles']:
+            if profile['row_idx'] in sections:
+                section_name = str(self.analyzer.sheet.cell(profile['row_idx'], 2).value or "Section")
+                current_section = section_name
+                sections_dict[current_section] = {'start': profile['row_idx'], 'end': profile['row_idx']}
+            elif current_section and profile['row_type'] == 'data_row':
+                sections_dict[current_section]['end'] = profile['row_idx']
+        
+        data_start = min([s['start'] for s in sections_dict.values()]) + 1 if sections_dict else header_row + 1
+        data_end = max([s['end'] for s in sections_dict.values()]) if sections_dict else data_start + 10
+        
+        # Detect label columns
+        label_columns, label_hierarchy = self.processor.detect_multi_level_labels(data_start, data_end)
+        
+        if not label_columns:
+            label_columns = [2]  # Column B typically has labels in financial statements
+            label_hierarchy = {2: "Metric"}
+        
+        # Extract headers
+        headers = []
+        for col_idx in data_columns:
+            header_cell = self.analyzer.sheet.cell(header_row, col_idx)
+            if header_cell.value:
+                headers.append(str(header_cell.value).strip())
+            else:
+                headers.append(f"Col_{get_column_letter(col_idx)}")
+        
+        preview = self.extract_preview_with_multilevel_labels(
+            headers, data_start, data_end, data_columns, label_columns
+        )
+        
+        if preview is None:
+            return None
+        
+        confidence = 0.85
+        
+        structure = TableStructure(
+            header_rows=[header_row],
+            data_start_row=data_start,
+            data_end_row=data_end,
+            data_columns=data_columns,
+            label_columns=label_columns,
+            label_hierarchy=label_hierarchy,
+            has_merged_headers=False,
+            multi_section=len(sections_dict) > 1,
+            sections=sections_dict,
+            confidence_score=confidence,
+            table_type=TableType.FINANCIAL_STATEMENT
+        )
+        
+        return ExtractionSuggestion(
+            name="Financial Statement",
+            description="Financial statement with multiple sections (Assets, Liabilities, etc.)",
+            confidence=confidence,
+            structure=structure,
+            preview=preview,
+            pros=["Captures multiple sections", "Handles financial formatting", "Preserves section structure"],
+            cons=["Complex structure", "May require verification"]
+        )
+    
+    def suggest_simple_range(self) -> Optional[ExtractionSuggestion]:
+        """Suggest simple contiguous data range"""
+        print("\n  📄 Analyzing simple range pattern...")
+        
+        first_row = None
+        first_col = None
+        last_row = None
+        last_col = None
+        
+        for row_idx in range(1, min(20, self.analyzer.sheet.max_row + 1)):
+            for col_idx in range(1, min(20, self.analyzer.sheet.max_column + 1)):
+                if self.analyzer.sheet.cell(row_idx, col_idx).value is not None:
+                    if first_row is None:
+                        first_row = row_idx
+                        first_col = col_idx
+                    last_row = row_idx
+                    last_col = max(last_col or 0, col_idx)
+        
+        if first_row is None:
+            return None
+        
+        for row_idx in range(first_row, min(self.analyzer.sheet.max_row + 1, first_row + 500)):
+            has_data = False
+            for col_idx in range(first_col, last_col + 1):
+                if self.analyzer.sheet.cell(row_idx, col_idx).value is not None:
+                    has_data = True
+                    break
+            if has_data:
+                last_row = row_idx
+            else:
+                break
+        
+        for col_idx in range(first_col, min(self.analyzer.sheet.max_column + 1, first_col + 50)):
+            has_data = False
+            for row_idx in range(first_row, last_row + 1):
+                if self.analyzer.sheet.cell(row_idx, col_idx).value is not None:
+                    has_data = True
+                    break
+            if has_data:
+                last_col = col_idx
+            else:
+                break
+        
+        data_columns = list(range(first_col, last_col + 1))
+        header_row = first_row
+        data_start = first_row + 1
+        
+        # Detect label columns
+        label_columns, label_hierarchy = self.processor.detect_multi_level_labels(data_start, last_row)
+        
+        if not label_columns:
+            label_columns = [first_col]
+            label_hierarchy = {first_col: "Metric"}
+        
+        headers = []
+        for col_idx in data_columns:
+            header_cell = self.analyzer.sheet.cell(header_row, col_idx)
+            if header_cell.value:
+                headers.append(str(header_cell.value).strip())
+            else:
+                headers.append(f"Col_{get_column_letter(col_idx)}")
+        
+        preview = self.extract_preview_with_multilevel_labels(
+            headers, data_start, last_row, data_columns, label_columns
+        )
+        
+        if preview is None:
+            return None
+        
+        structure = TableStructure(
+            header_rows=[header_row],
+            data_start_row=data_start,
+            data_end_row=last_row,
+            data_columns=data_columns,
+            label_columns=label_columns,
+            label_hierarchy=label_hierarchy,
+            has_merged_headers=False,
+            multi_section=False,
+            confidence_score=0.7,
+            table_type=TableType.RAW_DATA
+        )
+        
+        return ExtractionSuggestion(
+            name="Simple Data Range",
+            description="Simple contiguous block of data starting from first non-empty cell",
+            confidence=0.7,
+            structure=structure,
+            preview=preview,
+            pros=["Simple and direct", "No complex assumptions", "Fast extraction"],
+            cons=["May miss headers", "Assumes contiguous data"]
+        )
+    
+    def extract_preview_with_multilevel_labels(self, headers: List[str], data_start: int, 
+                                               data_end: int, data_columns: List[int],
+                                               label_columns: List[int]) -> Optional[pd.DataFrame]:
+        """Extract preview with multi-level labels"""
+        try:
+            # Extract data
+            data = []
+            hierarchical_labels = []
+            
+            for row_idx in range(data_start, min(data_end + 1, data_start + 20)):
+                row_data = []
+                for col_idx in data_columns:
+                    cell = self.analyzer.sheet.cell(row_idx, col_idx)
+                    row_data.append(cell.value)
+                data.append(row_data)
+                
+                # Build hierarchical label
+                if label_columns:
+                    label_parts = []
+                    for col_idx in label_columns:
+                        label_cell = self.analyzer.sheet.cell(row_idx, col_idx)
+                        if label_cell.value:
+                            label_parts.append(str(label_cell.value).strip())
+                    
+                    if label_parts:
+                        hierarchical_labels.append(" → ".join(label_parts))
+                    else:
+                        hierarchical_labels.append(f"Row_{row_idx}")
+                else:
+                    hierarchical_labels.append(f"Row_{row_idx}")
+            
+            # Create DataFrame
+            df = pd.DataFrame(data, columns=headers[:len(data_columns)])
+            df.index = hierarchical_labels
+            df.index.name = 'Hierarchical Index'
+            
+            return df.head(10)
+            
+        except Exception as e:
+            print(f"  ⚠ Preview extraction failed: {e}")
+            return None
+    
+    def find_label_column(self, data_columns: List[int]) -> int:
+        """Find the column that contains row labels"""
+        min_data_col = min(data_columns) if data_columns else 1
+        
+        for col_idx in range(1, min_data_col):
+            text_count = 0
+            for row_idx in range(1, min(30, self.analyzer.sheet.max_row + 1)):
+                cell = self.analyzer.sheet.cell(row_idx, col_idx)
+                if cell.value and isinstance(cell.value, str) and len(str(cell.value).strip()) > 0:
+                    text_count += 1
+            
+            if text_count > 10:
+                return col_idx
+        
+        return min_data_col if min_data_col > 1 else 1
+    
+    def calculate_table_confidence(self, header_row: int, data_columns: List[int], 
+                                  preview: pd.DataFrame) -> float:
+        """Calculate confidence score for a table structure"""
+        confidence = 0.5
+        
+        if data_columns:
+            header_cell = self.analyzer.sheet.cell(header_row, data_columns[0])
+            if header_cell.value:
+                header_str = str(header_cell.value).lower()
+                if re.search(r'fy\d{4}|20\d{2}', header_str):
+                    confidence += 0.2
+                if any(word in header_str for word in ['actual', 'baseline', 'forecast']):
+                    confidence += 0.1
+        
+        if len(data_columns) >= 3:
+            confidence += 0.1
+        
+        if preview is not None and len(preview) > 0:
+            null_ratio = preview.isna().sum().sum() / (len(preview) * len(preview.columns))
+            if null_ratio < 0.3:
+                confidence += 0.1
+            elif null_ratio < 0.5:
+                confidence += 0.05
+        
+        for col in data_columns:
+            for col_profile in self.analysis['column_profiles']:
+                if col_profile.index == col and col_profile.pattern_score > 0.7:
+                    confidence += 0.05
+                    break
+        
+        return min(confidence, 1.0)
+
+# ============================================================================
+# SMART MANUAL CONFIGURATOR WITH MULTI-LEVEL LABEL SELECTION
+# ============================================================================
+
+class SmartManualConfigurator:
+    """Smart manual configuration system with multi-level label support"""
+    
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.wb = None
+        self.sheet = None
+        self.sheet_name = None
+        self.analyzer = None
+        self.suggestions = []
+        self.selected_suggestion = None
+        self.final_config = None
+        self.processor = None
+    
+    def load_workbook(self, sheet_name: str = None):
+        """Load workbook and prepare for analysis"""
+        self.wb = openpyxl.load_workbook(self.file_path, data_only=True)
+        
+        if sheet_name:
+            self.sheet = self.wb[sheet_name]
+            self.sheet_name = sheet_name
+        else:
+            self.show_available_sheets()
+            choice = input("\nSelect sheet (enter name or number): ").strip()
+            
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(self.wb.sheetnames):
+                    self.sheet_name = self.wb.sheetnames[idx]
+                    self.sheet = self.wb[self.sheet_name]
+            else:
+                if choice in self.wb.sheetnames:
+                    self.sheet_name = choice
+                    self.sheet = self.wb[choice]
+                else:
+                    raise ValueError(f"Sheet '{choice}' not found")
+    
+    def show_available_sheets(self):
+        """Display all sheets"""
+        print("\n📚 Available sheets:")
+        print("-" * 50)
+        for i, name in enumerate(self.wb.sheetnames, 1):
+            print(f"  {i}. {name}")
+        print("-" * 50)
+    
+    def analyze_and_suggest(self) -> TableStructure:
+        """Analyze sheet and generate suggestions"""
+        print(f"\n{'='*80}")
+        print(f"🔍 SMART ANALYSIS: {self.sheet_name}")
+        print(f"{'='*80}")
+        
+        self.analyzer = SmartAnalyzer(self.sheet)
+        self.processor = MultiLevelProcessor(self.sheet)
+        suggestion_engine = SuggestionEngine(self.analyzer)
+        self.suggestions = suggestion_engine.generate_suggestions()
+        
+        self.display_suggestions_with_ranges()
+        self.choose_suggestion()
+        self.fine_tune_configuration()
+        
+        return self.final_config
+    
+    def display_suggestions_with_ranges(self):
+        """Display suggestions with cell ranges and option to preview"""
+        print(f"\n{'='*80}")
+        print("🎯 INTELLIGENT SUGGESTIONS WITH CELL RANGES")
+        print(f"{'='*80}")
+        
+        if not self.suggestions:
+            print("\n⚠ No suggestions generated. Falling back to manual mode.")
+            return
+        
+        for i, suggestion in enumerate(self.suggestions, 1):
+            confidence_pct = suggestion.confidence * 100
+            confidence_bar = "█" * int(confidence_pct / 10) + "░" * (10 - int(confidence_pct / 10))
+            
+            print(f"\n{'─'*80}")
+            print(f"Option {i}: {suggestion.name}  [Confidence: {confidence_bar} {confidence_pct:.0f}%]")
+            print(f"{'─'*80}")
+            print(f"📝 {suggestion.description}")
+            
+            # Display header information
+            print(f"\n📍 HEADER STRUCTURE:")
+            print(f"   • Number of header rows: {len(suggestion.structure.header_rows)}")
+            print(f"   • Header rows: {suggestion.structure.header_rows}")
+            
+            if len(suggestion.structure.header_rows) > 1:
+                print(f"   • Headers will be merged into: {self.get_header_preview(suggestion)}")
+            
+            # Display label information (NEW)
+            print(f"\n🏷️  LABEL STRUCTURE:")
+            print(f"   • Number of label columns: {len(suggestion.structure.label_columns)}")
+            print(f"   • Label columns: {[get_column_letter(c) for c in suggestion.structure.label_columns]}")
+            print(f"   • Label hierarchy: {suggestion.structure.get_label_hierarchy_str()}")
+            
+            if len(suggestion.structure.label_columns) > 1:
+                print(f"   • Labels will be merged into hierarchical index")
+            
+            # Display cell ranges
+            print(f"\n📍 CELL RANGES:")
+            
+            header_range = suggestion.structure.get_header_range()
+            if header_range:
+                print(f"   • Headers: {header_range}")
+                print(f"     - Rows: {header_range.start_row}-{header_range.end_row}")
+                print(f"     - Columns: {get_column_letter(header_range.start_col)}-{get_column_letter(header_range.end_col)}")
+            
+            data_range = suggestion.structure.get_data_range()
+            if data_range:
+                print(f"   • Data: {data_range}")
+                print(f"     - Rows: {data_range.start_row}-{data_range.end_row}")
+                print(f"     - Columns: {get_column_letter(data_range.start_col)}-{get_column_letter(data_range.end_col)}")
+                rows = data_range.end_row - data_range.start_row + 1
+                cols = data_range.end_col - data_range.start_col + 1
+                print(f"     - Size: {rows} rows × {cols} columns")
+            
+            label_range = suggestion.structure.get_label_range()
+            if label_range:
+                print(f"   • Labels: {label_range}")
+                print(f"     - Rows: {label_range.start_row}-{label_range.end_row}")
+                print(f"     - Columns: {get_column_letter(label_range.start_col)}-{get_column_letter(label_range.end_col)}")
+            
+            # Display sections if any
+            if suggestion.structure.sections:
+                print(f"\n📂 SECTIONS DETECTED:")
+                for section_name, section_range in suggestion.structure.sections.items():
+                    print(f"   • {section_name}: Columns {get_column_letter(section_range[0])}-{get_column_letter(section_range[-1])}")
+            
+            print(f"\n✅ Pros:")
+            for pro in suggestion.pros:
+                print(f"   • {pro}")
+            
+            print(f"\n⚠ Cons:")
+            for con in suggestion.cons:
+                print(f"   • {con}")
+            
+            print(f"\n📊 PREVIEW (With Hierarchical Labels):")
+            print("-" * 80)
+            print(suggestion.preview.to_string())
+            print("-" * 80)
+            
+            # Option to see full table preview
+            print(f"\n🔍 Options:")
+            print(f"   [P] Preview full table for this suggestion")
+            print(f"   [L] Adjust label columns")
+            print(f"   [S] Skip to next suggestion")
+            print(f"   [Enter] Continue to selection")
+            
+            choice = input(f"\nOption for suggestion {i} (P/L/S/Enter): ").strip().upper()
+            if choice == 'P':
+                self.show_full_table_preview(suggestion)
+            elif choice == 'L':
+                self.adjust_label_columns(suggestion)
+    
+    def get_header_preview(self, suggestion: ExtractionSuggestion) -> str:
+        """Get a preview of how headers will be merged"""
+        if len(suggestion.structure.header_rows) <= 1:
+            return "Single header row (no merging needed)"
+        
+        header_rows = sorted(suggestion.structure.header_rows)
+        data_columns = suggestion.structure.data_columns
+        
+        merged_headers = self.processor.merge_multi_level_headers(header_rows, data_columns)
+        
+        if merged_headers:
+            preview = ", ".join(merged_headers[:5])
+            if len(merged_headers) > 5:
+                preview += f", ... ({len(merged_headers)} total)"
+            return preview
+        
+        return "Unable to preview headers"
+    
+    def adjust_label_columns(self, suggestion: ExtractionSuggestion):
+        """Allow user to adjust which columns are used as labels"""
+        print(f"\n{'='*80}")
+        print("🏷️  ADJUST LABEL COLUMNS")
+        print(f"{'='*80}")
+        
+        print(f"\nCurrent label columns: {[get_column_letter(c) for c in suggestion.structure.label_columns]}")
+        print(f"Current label hierarchy: {suggestion.structure.get_label_hierarchy_str()}")
+        
+        print("\n📊 Available columns to the left of data:")
+        data_columns = suggestion.structure.data_columns
+        if data_columns:
+            min_data_col = min(data_columns)
+            for col_idx in range(1, min_data_col):
+                col_letter = get_column_letter(col_idx)
+                # Show sample values
+                sample_values = []
+                for row_idx in range(suggestion.structure.data_start_row, 
+                                    min(suggestion.structure.data_start_row + 5, 
+                                        suggestion.structure.data_end_row + 1)):
+                    cell = self.sheet.cell(row_idx, col_idx)
+                    if cell.value:
+                        sample_values.append(str(cell.value)[:20])
+                
+                sample_str = ", ".join(sample_values) if sample_values else "No data"
+                print(f"   Column {col_letter}: {sample_str}")
+        
+        print("\nOptions:")
+        print("   Enter label columns (comma-separated, e.g., 'A' or 'A,B'):")
+        print("   Example: 'A' for single label column")
+        print("   Example: 'A,B' for multi-level labels (Category → Subcategory)")
+        print("   Press Enter to keep current")
+        
+        label_input = input("\nEnter label columns: ").strip().upper()
+        
+        if label_input:
+            new_label_columns = []
+            new_label_hierarchy = {}
+            
+            for i, col in enumerate(label_input.split(',')):
+                col = col.strip()
+                if col.isalpha():
+                    col_idx = column_index_from_string(col)
+                    new_label_columns.append(col_idx)
+                    
+                    # Assign hierarchy level names
+                    if i == 0:
+                        hierarchy_level = "Category"
+                    elif i == 1:
+                        hierarchy_level = "Subcategory"
+                    else:
+                        hierarchy_level = f"Level_{i+1}"
+                    
+                    new_label_hierarchy[col_idx] = hierarchy_level
+            
+            if new_label_columns:
+                suggestion.structure.label_columns = new_label_columns
+                suggestion.structure.label_hierarchy = new_label_hierarchy
+                
+                # Update preview
+                headers = self.get_headers_for_preview(suggestion)
+                new_preview = self.extract_preview_with_labels(
+                    headers, 
+                    suggestion.structure.data_start_row,
+                    suggestion.structure.data_end_row,
+                    suggestion.structure.data_columns,
+                    new_label_columns
+                )
+                
+                if new_preview is not None:
+                    suggestion.preview = new_preview
+                    print("\n✓ Label columns updated!")
+                    print("\n📊 Updated Preview:")
+                    print("-" * 80)
+                    print(new_preview.to_string())
+                    print("-" * 80)
+    
+    def get_headers_for_preview(self, suggestion: ExtractionSuggestion) -> List[str]:
+        """Get headers for preview"""
+        if len(suggestion.structure.header_rows) > 1:
+            return self.processor.merge_multi_level_headers(
+                suggestion.structure.header_rows, 
+                suggestion.structure.data_columns
+            )
+        else:
+            headers = []
+            header_row = suggestion.structure.header_rows[0]
+            for col_idx in suggestion.structure.data_columns:
+                header_cell = self.sheet.cell(header_row, col_idx)
+                if header_cell.value:
+                    headers.append(str(header_cell.value).strip())
+                else:
+                    headers.append(f"Col_{get_column_letter(col_idx)}")
+            return headers
+    
+    def extract_preview_with_labels(self, headers: List[str], data_start: int, 
+                                    data_end: int, data_columns: List[int],
+                                    label_columns: List[int]) -> Optional[pd.DataFrame]:
+        """Extract preview with specified label columns"""
+        try:
+            data = []
+            hierarchical_labels = []
+            
+            for row_idx in range(data_start, min(data_end + 1, data_start + 20)):
+                row_data = []
+                for col_idx in data_columns:
+                    cell = self.sheet.cell(row_idx, col_idx)
+                    row_data.append(cell.value)
+                data.append(row_data)
+                
+                # Build hierarchical label
+                if label_columns:
+                    label_parts = []
+                    for col_idx in label_columns:
+                        label_cell = self.sheet.cell(row_idx, col_idx)
+                        if label_cell.value:
+                            label_parts.append(str(label_cell.value).strip())
+                    
+                    if label_parts:
+                        hierarchical_labels.append(" → ".join(label_parts))
+                    else:
+                        hierarchical_labels.append(f"Row_{row_idx}")
+                else:
+                    hierarchical_labels.append(f"Row_{row_idx}")
+            
+            df = pd.DataFrame(data, columns=headers[:len(data_columns)])
+            df.index = hierarchical_labels
+            df.index.name = 'Hierarchical Index'
+            
+            return df.head(10)
+            
+        except Exception as e:
+            print(f"  ⚠ Preview extraction failed: {e}")
+            return None
+    
+    def show_full_table_preview(self, suggestion: ExtractionSuggestion):
+        """Show full table preview with hierarchical labels"""
+        print(f"\n{'='*80}")
+        print(f"📊 FULL TABLE PREVIEW: {suggestion.name}")
+        print(f"{'='*80}")
+        
+        structure = suggestion.structure
+        header_rows = sorted(structure.header_rows)
+        data_start = structure.data_start_row
+        data_end = structure.data_end_row
+        data_columns = structure.data_columns
+        label_columns = structure.label_columns
+        
+        # Merge multi-level headers if needed
+        if len(header_rows) > 1:
+            headers = self.processor.merge_multi_level_headers(header_rows, data_columns)
+            print(f"\n🔗 Merged Headers: {headers}")
+        else:
+            headers = []
+            for col_idx in data_columns:
+                header_cell = self.sheet.cell(header_rows[0], col_idx)
+                if header_cell.value:
+                    headers.append(str(header_cell.value).strip())
+                else:
+                    headers.append(f"Col_{get_column_letter(col_idx)}")
+        
+        # Extract data with hierarchical labels
+        data = []
+        hierarchical_labels = []
+        
+        for row_idx in range(data_start, data_end + 1):
+            row_data = []
+            has_data = False
+            
+            for col_idx in data_columns:
+                cell_value = self.sheet.cell(row_idx, col_idx).value
+                row_data.append(cell_value)
+                if cell_value is not None:
+                    has_data = True
+            
+            if has_data:
+                data.append(row_data)
+                
+                # Build hierarchical label
+                if label_columns:
+                    label_parts = []
+                    for col_idx in label_columns:
+                        label_cell = self.sheet.cell(row_idx, col_idx)
+                        if label_cell.value:
+                            label = str(label_cell.value).strip()
+                            # Clean up labels
+                            label = re.sub(r'^[A-Z]\*\d+\s*', '', label)
+                            label = re.sub(r'^V\*\d+\s*', '', label)
+                            label_parts.append(label)
+                        else:
+                            label_parts.append("")
+                    
+                    if label_parts:
+                        # Remove empty parts and join
+                        non_empty_parts = [p for p in label_parts if p]
+                        if non_empty_parts:
+                            hierarchical_label = " → ".join(non_empty_parts)
+                        else:
+                            hierarchical_label = f"Row_{row_idx}"
+                    else:
+                        hierarchical_label = f"Row_{row_idx}"
+                else:
+                    hierarchical_label = f"Row_{row_idx}"
+                
+                hierarchical_labels.append(hierarchical_label)
+        
+        # Create DataFrame with hierarchical index
+        df = pd.DataFrame(data, columns=headers[:len(data_columns)])
+        df.index = hierarchical_labels
+        df.index.name = 'Hierarchical Index'
+        
+        # Clean up
+        df = df.dropna(how='all')
+        df = df.dropna(axis=1, how='all')
+        
+        # Convert numeric columns
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='ignore')
+        
+        # Display full preview
+        print(f"\n📊 Table Shape: {df.shape[0]} rows × {df.shape[1]} columns")
+        print(f"\n📋 Full Data Preview (with hierarchical labels):")
+        print("-" * 100)
+        print(df.to_string())
+        print("-" * 100)
+        
+        # Ask if user wants to export this preview
+        export_choice = input("\nExport this table? (y/n): ").strip().lower()
+        if export_choice == 'y':
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"preview_{suggestion.name.replace(' ', '_')}_{timestamp}.xlsx"
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name=self.sheet_name, index=True)
+            print(f"✓ Preview exported to: {filename}")
+        
+        input("\nPress Enter to continue...")
+    
+    def choose_suggestion(self):
+        """Let user choose a suggestion"""
+        print(f"\n{'='*80}")
+        print("🎯 SELECT EXTRACTION METHOD")
+        print(f"{'='*80}")
+        
+        if not self.suggestions:
+            self.selected_suggestion = None
+            return
+        
+        print("\nOptions:")
+        for i in range(len(self.suggestions)):
+            print(f"  {i+1}. {self.suggestions[i].name}")
+        print(f"  M. Manual Configuration")
+        
+        while True:
+            choice = input("\nSelect option: ").strip().upper()
+            
+            if choice == 'M':
+                self.selected_suggestion = None
+                print("\n🖱️  Switching to manual configuration mode...")
+                break
+            elif choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(self.suggestions):
+                    self.selected_suggestion = self.suggestions[idx]
+                    print(f"\n✓ Selected: {self.selected_suggestion.name}")
+                    
+                    # Show final confirmation with label hierarchy
+                    print(f"\n📌 CONFIRMATION:")
+                    if len(self.selected_suggestion.structure.header_rows) > 1:
+                        print(f"   • Multi-level headers detected ({len(self.selected_suggestion.structure.header_rows)} rows)")
+                        merged_preview = self.get_header_preview(self.selected_suggestion)
+                        print(f"   • Headers will be merged into: {merged_preview}")
+                    
+                    print(f"   • Label columns: {[get_column_letter(c) for c in self.selected_suggestion.structure.label_columns]}")
+                    print(f"   • Label hierarchy: {self.selected_suggestion.structure.get_label_hierarchy_str()}")
+                    
+                    header_range = self.selected_suggestion.structure.get_header_range()
+                    data_range = self.selected_suggestion.structure.get_data_range()
+                    if header_range:
+                        print(f"   • Headers will be extracted from: {header_range}")
+                    if data_range:
+                        print(f"   • Data will be extracted from: {data_range}")
+                    
+                    confirm = input("\nProceed with this selection? (y/n): ").strip().lower()
+                    if confirm == 'y':
+                        break
+                    else:
+                        print("Please select another option...")
+                        continue
+                else:
+                    print(f"Invalid option. Choose 1-{len(self.suggestions)} or M")
+            else:
+                print(f"Invalid option. Choose 1-{len(self.suggestions)} or M")
+    
+    def fine_tune_configuration(self):
+        """Allow fine-tuning of selected configuration"""
+        if not self.selected_suggestion:
+            self.final_config = self.manual_configuration()
+            return
+        
+        print(f"\n{'='*80}")
+        print("🔧 FINE-TUNE CONFIGURATION")
+        print(f"{'='*80}")
+        
+        structure = self.selected_suggestion.structure
+        
+        print(f"\nCurrent configuration:")
+        print(f"  • Header rows: {structure.header_rows}")
+        print(f"  • Data start row: {structure.data_start_row}")
+        print(f"  • Data columns: {[get_column_letter(c) for c in structure.data_columns]}")
+        print(f"  • Label columns: {[get_column_letter(c) for c in structure.label_columns]}")
+        print(f"  • Label hierarchy: {structure.get_label_hierarchy_str()}")
+        
+        if len(structure.header_rows) > 1:
+            print(f"  • Multi-level headers: Yes ({len(structure.header_rows)} rows)")
+            merged_preview = self.get_header_preview(self.selected_suggestion)
+            print(f"  • Merged headers preview: {merged_preview}")
+        
+        header_range = structure.get_header_range()
+        data_range = structure.get_data_range()
+        if header_range:
+            print(f"  • Header range: {header_range}")
+        if data_range:
+            print(f"  • Data range: {data_range}")
+        
+        print("\nFine-tuning options:")
+        print("  1. Accept and continue")
+        print("  2. View full table preview")
+        print("  3. Adjust header rows")
+        print("  4. Adjust data columns")
+        print("  5. Adjust label columns")
+        print("  6. Start over")
+        
+        while True:
+            choice = input("\nSelect option (1-6): ").strip()
+            
+            if choice == '1':
+                structure.data_end_row = self.detect_data_end(structure)
+                self.final_config = structure
+                break
+            elif choice == '2':
+                self.show_full_table_preview(self.selected_suggestion)
+            elif choice == '3':
+                new_headers = input(f"Enter header rows (current: {structure.header_rows}): ").strip()
+                if new_headers:
+                    structure.header_rows = [int(h.strip()) for h in new_headers.split(',')]
+                    print("✓ Header rows updated")
+            elif choice == '4':
+                new_cols = input(f"Enter data columns (current: {[get_column_letter(c) for c in structure.data_columns]}): ").strip()
+                if new_cols:
+                    structure.data_columns = []
+                    for col in new_cols.split(','):
+                        col = col.strip()
+                        if col.isalpha():
+                            structure.data_columns.append(column_index_from_string(col.upper()))
+                        else:
+                            structure.data_columns.append(int(col))
+                    print("✓ Data columns updated")
+            elif choice == '5':
+                self.adjust_label_columns_for_selected(structure)
+            elif choice == '6':
+                self.analyze_and_suggest()
+                return
+            else:
+                print("Invalid option")
+    
+    def adjust_label_columns_for_selected(self, structure: TableStructure):
+        """Adjust label columns for selected suggestion"""
+        print(f"\n{'='*80}")
+        print("🏷️  ADJUST LABEL COLUMNS")
+        print(f"{'='*80}")
+        
+        print(f"\nCurrent label columns: {[get_column_letter(c) for c in structure.label_columns]}")
+        print(f"Current label hierarchy: {structure.get_label_hierarchy_str()}")
+        
+        print("\n📊 Available columns to the left of data:")
+        if structure.data_columns:
+            min_data_col = min(structure.data_columns)
+            for col_idx in range(1, min_data_col):
+                col_letter = get_column_letter(col_idx)
+                sample_values = []
+                for row_idx in range(structure.data_start_row, 
+                                    min(structure.data_start_row + 5, 
+                                        structure.data_end_row + 1)):
+                    cell = self.sheet.cell(row_idx, col_idx)
+                    if cell.value:
+                        sample_values.append(str(cell.value)[:20])
+                
+                sample_str = ", ".join(sample_values) if sample_values else "No data"
+                print(f"   Column {col_letter}: {sample_str}")
+        
+        print("\nOptions:")
+        print("   Enter label columns (comma-separated, e.g., 'A' or 'A,B'):")
+        print("   Example: 'A' for single label column")
+        print("   Example: 'A,B' for multi-level labels (Category → Subcategory)")
+        print("   Press Enter to keep current")
+        
+        label_input = input("\nEnter label columns: ").strip().upper()
+        
+        if label_input:
+            new_label_columns = []
+            new_label_hierarchy = {}
+            
+            for i, col in enumerate(label_input.split(',')):
+                col = col.strip()
+                if col.isalpha():
+                    col_idx = column_index_from_string(col)
+                    new_label_columns.append(col_idx)
+                    
+                    if i == 0:
+                        hierarchy_level = "Category"
+                    elif i == 1:
+                        hierarchy_level = "Subcategory"
+                    else:
+                        hierarchy_level = f"Level_{i+1}"
+                    
+                    new_label_hierarchy[col_idx] = hierarchy_level
+            
+            if new_label_columns:
+                structure.label_columns = new_label_columns
+                structure.label_hierarchy = new_label_hierarchy
+                print("✓ Label columns updated!")
+    
+    def detect_data_end(self, structure: TableStructure) -> int:
+        """Detect where data ends"""
+        data_start = structure.data_start_row
+        data_columns = structure.data_columns
+        
+        last_row = data_start
+        consecutive_empty = 0
+        
+        for row_idx in range(data_start, min(data_start + 500, self.sheet.max_row + 1)):
+            has_data = False
+            for col_idx in data_columns:
+                if self.sheet.cell(row_idx, col_idx).value is not None:
+                    has_data = True
+                    break
+            
+            if has_data:
+                last_row = row_idx
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+        
+        return last_row
+    
+    def manual_configuration(self) -> TableStructure:
+        """Fallback manual configuration with label selection"""
+        print(f"\n{'='*80}")
+        print("🖱️  MANUAL CONFIGURATION MODE")
+        print(f"{'='*80}")
+        
+        self.display_sheet_preview()
+        
+        header_input = input("\nEnter header rows (comma-separated, e.g., '5' or '5,6,7'): ").strip()
+        header_rows = [int(h.strip()) for h in header_input.split(',')] if header_input else [1]
+        
+        data_start = int(input("Enter first data row: ").strip() or "2")
+        
+        cols_input = input("Enter data columns (comma-separated, e.g., 'C,D,E'): ").strip()
+        if cols_input:
+            data_columns = []
+            for col in cols_input.split(','):
+                col = col.strip()
+                if col.isalpha():
+                    data_columns.append(column_index_from_string(col.upper()))
+                else:
+                    data_columns.append(int(col))
+        else:
+            data_columns = list(range(1, min(10, self.sheet.max_column + 1)))
+        
+        # Ask for label columns (NEW)
+        print("\n🏷️  LABEL COLUMNS SELECTION:")
+        print("   Label columns are used as row identifiers (e.g., Metric names, Categories)")
+        print("   You can select multiple columns for hierarchical labels (e.g., Category, Subcategory)")
+        print("   Example: 'A' for single label column")
+        print("   Example: 'A,B' for multi-level labels")
+        
+        label_input = input("Enter label columns (comma-separated, e.g., 'A' or 'A,B'): ").strip().upper()
+        
+        if label_input:
+            label_columns = []
+            label_hierarchy = {}
+            
+            for i, col in enumerate(label_input.split(',')):
+                col = col.strip()
+                if col.isalpha():
+                    col_idx = column_index_from_string(col)
+                    label_columns.append(col_idx)
+                    
+                    if i == 0:
+                        hierarchy_level = "Category"
+                    elif i == 1:
+                        hierarchy_level = "Subcategory"
+                    else:
+                        hierarchy_level = f"Level_{i+1}"
+                    
+                    label_hierarchy[col_idx] = hierarchy_level
+        else:
+            # Auto-detect label columns
+            label_columns = [1]  # Default to first column
+            label_hierarchy = {1: "Metric"}
+        
+        # Show the range that will be extracted
+        min_data_col = min(data_columns)
+        max_data_col = max(data_columns)
+        
+        print(f"\n📌 Extracting:")
+        if len(header_rows) > 1:
+            print(f"   • Multi-level headers: Rows {header_rows}, Columns {get_column_letter(min_data_col)}-{get_column_letter(max_data_col)}")
+        else:
+            print(f"   • Headers: Row {header_rows[0]}, Columns {get_column_letter(min_data_col)}-{get_column_letter(max_data_col)}")
+        
+        print(f"   • Data: Rows {data_start}-?, Columns {get_column_letter(min_data_col)}-{get_column_letter(max_data_col)}")
+        print(f"   • Label columns: {[get_column_letter(c) for c in label_columns]} → {structure.get_label_hierarchy_str() if 'structure' in locals() else 'Hierarchical labels'}")
+        
+        confirm = input("\nProceed with this configuration? (y/n): ").strip().lower()
+        if confirm != 'y':
+            return self.manual_configuration()
+        
+        return TableStructure(
+            header_rows=header_rows,
+            data_start_row=data_start,
+            data_end_row=self.detect_data_end_from_config(data_start, data_columns),
+            data_columns=data_columns,
+            label_columns=label_columns,
+            label_hierarchy=label_hierarchy,
+            has_merged_headers=False,
+            multi_section=False,
+            confidence_score=0.5,
+            table_type=TableType.UNKNOWN
+        )
+    
+    def display_sheet_preview(self, max_rows: int = 20, max_cols: int = 15):
+        """Display sheet preview"""
+        print(f"\n📊 Sheet Preview: {self.sheet_name}")
+        print("=" * 100)
+        
+        max_show_rows = min(max_rows, self.sheet.max_row)
+        max_show_cols = min(max_cols, self.sheet.max_column)
+        
+        print("    ", end="")
+        for col_idx in range(1, max_show_cols + 1):
+            col_letter = get_column_letter(col_idx)
+            print(f"{col_letter:^8}", end="")
+        print()
+        
+        print("    ", end="")
+        for _ in range(max_show_cols):
+            print("--------", end="")
+        print()
+        
+        for row_idx in range(1, max_show_rows + 1):
+            print(f"{row_idx:3} |", end="")
+            for col_idx in range(1, max_show_cols + 1):
+                cell = self.sheet.cell(row_idx, col_idx)
+                value = cell.value
+                
+                if value is None:
+                    display_value = ""
+                else:
+                    value_str = str(value).strip()
+                    if len(value_str) > 7:
+                        display_value = value_str[:5] + "..."
+                    else:
+                        display_value = value_str
+                
+                for merged_range in self.sheet.merged_cells.ranges:
+                    if cell.coordinate in merged_range:
+                        display_value = f"[{display_value}]"
+                        break
+                
+                print(f"{display_value:^8}", end="")
+            print()
+        
+        print("=" * 100)
+    
+    def detect_data_end_from_config(self, data_start: int, data_columns: List[int]) -> int:
+        """Detect data end for manual config"""
+        last_row = data_start
+        consecutive_empty = 0
+        
+        for row_idx in range(data_start, min(data_start + 500, self.sheet.max_row + 1)):
+            has_data = False
+            for col_idx in data_columns:
+                if self.sheet.cell(row_idx, col_idx).value is not None:
+                    has_data = True
+                    break
+            
+            if has_data:
+                last_row = row_idx
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+        
+        return last_row
+    
+    def extract_table(self, structure: TableStructure) -> pd.DataFrame:
+        """Extract the final table with multi-level labels"""
+        print(f"\n{'='*80}")
+        print("📊 EXTRACTING TABLE")
+        print(f"{'='*80}")
+        
+        print(f"\n📌 Extracting from ranges:")
+        header_range = structure.get_header_range()
+        data_range = structure.get_data_range()
+        if header_range:
+            print(f"   • Headers: {header_range}")
+        if data_range:
+            print(f"   • Data: {data_range}")
+        
+        print(f"   • Label columns: {[get_column_letter(c) for c in structure.label_columns]} → {structure.get_label_hierarchy_str()}")
+        
+        header_rows = sorted(structure.header_rows)
+        data_start = structure.data_start_row
+        data_end = structure.data_end_row
+        data_columns = structure.data_columns
+        label_columns = structure.label_columns
+        
+        # Merge multi-level headers if there are multiple header rows
+        if len(header_rows) > 1:
+            print(f"\n🔗 Merging {len(header_rows)} header rows...")
+            headers = self.processor.merge_multi_level_headers(header_rows, data_columns)
+            print(f"   Merged headers: {headers}")
+        else:
+            headers = []
+            for col_idx in data_columns:
+                header_cell = self.sheet.cell(header_rows[0], col_idx)
+                if header_cell.value:
+                    headers.append(str(header_cell.value).strip())
+                else:
+                    headers.append(f"Col_{get_column_letter(col_idx)}")
+        
+        # Extract data with hierarchical labels
+        data = []
+        hierarchical_labels = []
+        
+        print(f"\n📊 Extracting data with hierarchical labels...")
+        
+        for row_idx in range(data_start, data_end + 1):
+            row_data = []
+            has_data = False
+            
+            for col_idx in data_columns:
+                cell_value = self.sheet.cell(row_idx, col_idx).value
+                row_data.append(cell_value)
+                if cell_value is not None:
+                    has_data = True
+            
+            if has_data:
+                data.append(row_data)
+                
+                # Build hierarchical label
+                if label_columns:
+                    label_parts = []
+                    for col_idx in label_columns:
+                        label_cell = self.sheet.cell(row_idx, col_idx)
+                        if label_cell.value:
+                            label = str(label_cell.value).strip()
+                            # Clean up labels
+                            label = re.sub(r'^[A-Z]\*\d+\s*', '', label)
+                            label = re.sub(r'^V\*\d+\s*', '', label)
+                            label_parts.append(label)
+                        else:
+                            label_parts.append("")
+                    
+                    if label_parts:
+                        # Remove empty parts and join
+                        non_empty_parts = [p for p in label_parts if p]
+                        if non_empty_parts:
+                            hierarchical_label = " → ".join(non_empty_parts)
+                        else:
+                            hierarchical_label = f"Row_{row_idx}"
+                    else:
+                        hierarchical_label = f"Row_{row_idx}"
+                else:
+                    hierarchical_label = f"Row_{row_idx}"
+                
+                hierarchical_labels.append(hierarchical_label)
+        
+        # Create DataFrame with hierarchical index
+        df = pd.DataFrame(data, columns=headers[:len(data_columns)])
+        df.index = hierarchical_labels
+        df.index.name = 'Hierarchical Index'
+        
+        # Clean up
+        df = df.dropna(how='all')
+        df = df.dropna(axis=1, how='all')
+        
+        # Convert numeric columns
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='ignore')
+        
+        print(f"\n✓ Table extracted: {len(df)} rows × {len(df.columns)} columns")
+        print(f"✓ Hierarchical index created with {len(label_columns)} level(s)")
+        print(f"✓ Headers: {list(df.columns)}")
+        
+        return df
+    
+    def save_table(self, df: pd.DataFrame, output_format: str = 'excel', output_path: str = None):
+        """Save extracted table"""
+        if output_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"extracted_{self.sheet_name}_{timestamp}"
+        
+        if output_format == 'excel':
+            output_file = f"{output_path}.xlsx"
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name=self.sheet_name, index=True)
+            print(f"\n✓ Saved to: {output_file}")
+        
+        elif output_format == 'csv':
+            output_file = f"{output_path}.csv"
+            df.to_csv(output_file)
+            print(f"\n✓ Saved to: {output_file}")
+        
+        elif output_format == 'both':
+            excel_file = f"{output_path}.xlsx"
+            csv_file = f"{output_path}.csv"
+            with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name=self.sheet_name, index=True)
+            df.to_csv(csv_file)
+            print(f"\n✓ Saved to: {excel_file} and {csv_file}")
+    
+    def close(self):
+        """Close workbook"""
+        if self.wb:
+            self.wb.close()
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main execution function"""
+    print("="*80)
+    print("🧠 ADVANCED SMART TABLE EXTRACTOR WITH MULTI-LEVEL LABELS")
+    print("="*80)
+    
+    file_path = input("\nEnter Excel file path: ").strip().strip('"').strip("'")
+    
+    if not os.path.exists(file_path):
+        print(f"❌ File not found: {file_path}")
+        return
+    
+    configurator = SmartManualConfigurator(file_path)
+    
+    try:
+        configurator.load_workbook()
+        structure = configurator.analyze_and_suggest()
+        df = configurator.extract_table(structure)
+        
+        print(f"\n{'='*80}")
+        print("📊 FINAL TABLE PREVIEW")
+        print(f"{'='*80}")
+        print(df.head(15).to_string())
+        print(f"\nShape: {df.shape}")
+        print(f"Index: {df.index.name}")
+        print(f"Columns: {list(df.columns)}")
+        
+        print(f"\n{'='*80}")
+        print("💾 SAVE OPTIONS")
+        print(f"{'='*80}")
+        
+        print("\nOptions:")
+        print("  1. Save as Excel")
+        print("  2. Save as CSV")
+        print("  3. Save as both")
+        print("  4. Copy to clipboard")
+        print("  5. Exit without saving")
+        
+        choice = input("\nSelect option (1-5): ").strip()
+        
+        if choice == '1':
+            configurator.save_table(df, 'excel')
+        elif choice == '2':
+            configurator.save_table(df, 'csv')
+        elif choice == '3':
+            configurator.save_table(df, 'both')
+        elif choice == '4':
+            df.to_clipboard()
+            print("✓ Table copied to clipboard!")
+        
+        print("\n✅ Extraction complete!")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠ Operation cancelled by user")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        traceback.print_exc()
+    finally:
+        configurator.close()
+
+if __name__ == "__main__":
+    main()
