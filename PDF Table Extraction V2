@@ -1,162 +1,182 @@
-import pdfplumber
-import camelot
+#!/usr/bin/env python3
+"""
+Production-Grade Financial PDF Table Extractor (v2)
+- Multi-strategy extraction
+- CV-based table detection (ACTIVE)
+- Region-based extraction
+- Table scoring + deduplication
+- Multi-page table stitching
+- Financial data cleaning
+"""
+
+import os
+import json
 import pandas as pd
-import pytesseract
-from pdf2image import convert_from_path
 import numpy as np
-import re
+from pathlib import Path
+import fitz  # PyMuPDF
+import cv2
+from PIL import Image
+import io
+import camelot
+import pdfplumber
+import tabula
+from dataclasses import dataclass
+from typing import List, Tuple
+import hashlib
+import shutil
 
-# -------------------------------
-# CONFIG
-# -------------------------------
-PDF_PATH = "input.pdf"
-OCR_DPI = 300
+# ================= CONFIG =================
 
+@dataclass
+class Config:
+    output_formats: List[str] = None
 
-# -------------------------------
-# STEP 1: Detect if PDF is scanned
-# -------------------------------
-def is_scanned_pdf(pdf_path):
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages[:3]:
-            if page.extract_text():
-                return False
-    return True
+    def __post_init__(self):
+        if self.output_formats is None:
+            self.output_formats = ['csv']
 
+# ================= CV DETECTOR =================
 
-# -------------------------------
-# STEP 2: OCR Extraction (Fallback)
-# -------------------------------
-def extract_tables_ocr(pdf_path):
-    print("Using OCR pipeline...")
-    images = convert_from_path(pdf_path, dpi=OCR_DPI)
-    
-    tables = []
-    
-    for i, img in enumerate(images):
-        text = pytesseract.image_to_string(img)
-        
-        # Basic table detection via line splitting
-        lines = text.split("\n")
-        rows = [re.split(r"\s{2,}", line.strip()) for line in lines if line.strip()]
-        
-        df = pd.DataFrame(rows)
-        tables.append(df)
-    
-    return tables
+class CVTableDetector:
+    def detect(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        binary = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV,11,2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
+        dilated = cv2.dilate(binary,kernel,iterations=2)
+        contours,_ = cv2.findContours(dilated,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
 
+        boxes=[]
+        h_img,w_img=image.shape[:2]
+        for c in contours:
+            x,y,w,h = cv2.boundingRect(c)
+            if w*h > 0.01*w_img*h_img and w>100 and h>50:
+                boxes.append((x,y,w,h))
+        return boxes
 
-# -------------------------------
-# STEP 3: Camelot Extraction
-# -------------------------------
-def extract_with_camelot(pdf_path):
-    print("Using Camelot...")
-    
-    tables = []
-    
-    try:
-        tables_lattice = camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
-        tables_stream = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
-        
-        for t in tables_lattice:
-            tables.append(t.df)
-        
-        for t in tables_stream:
-            tables.append(t.df)
-            
-    except Exception as e:
-        print("Camelot failed:", e)
-    
-    return tables
+# ================= CORE =================
 
+class Extractor:
 
-# -------------------------------
-# STEP 4: pdfplumber Extraction
-# -------------------------------
-def extract_with_pdfplumber(pdf_path):
-    print("Using pdfplumber...")
-    
-    tables = []
-    
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            extracted = page.extract_tables()
-            
-            for table in extracted:
-                df = pd.DataFrame(table)
-                tables.append(df)
-    
-    return tables
+    def __init__(self):
+        self.detector = CVTableDetector()
 
+    def pdf_to_images(self,pdf_path):
+        doc = fitz.open(pdf_path)
+        images=[]
+        for page in doc:
+            pix = page.get_pixmap()
+            img = Image.open(io.BytesIO(pix.tobytes()))
+            images.append(np.array(img))
+        return images
 
-# -------------------------------
-# STEP 5: Smart Cleaning
-# -------------------------------
-def clean_table(df):
-    df = df.replace("", np.nan)
-    
-    # Drop empty rows/columns
-    df = df.dropna(how='all')
-    df = df.dropna(axis=1, how='all')
-    
-    # Fix header if first row looks like header
-    if df.shape[0] > 1:
-        df.columns = df.iloc[0]
-        df = df[1:]
-    
-    df.reset_index(drop=True, inplace=True)
-    
-    return df
+    def detect_regions(self,pdf_path):
+        images = self.pdf_to_images(pdf_path)
+        all_regions = {}
+        for i,img in enumerate(images):
+            boxes = self.detector.detect(img)
+            regions=[]
+            for (x,y,w,h) in boxes:
+                regions.append(f"{x},{y},{x+w},{y+h}")
+            all_regions[i+1]=regions
+        return all_regions
 
+    def extract_camelot(self,pdf_path,regions):
+        tables=[]
+        for page,areas in regions.items():
+            if not areas: continue
+            try:
+                t = camelot.read_pdf(pdf_path,pages=str(page),flavor='stream',table_areas=areas)
+                tables.extend([tb.df for tb in t])
+            except:
+                pass
+        return tables
 
-# -------------------------------
-# STEP 6: Merge Similar Tables
-# -------------------------------
-def merge_tables(tables):
-    merged = []
-    
-    for df in tables:
-        if df.shape[1] > 1:
-            merged.append(df)
-    
-    return merged
+    def extract_pdfplumber(self,pdf_path):
+        tables=[]
+        with pdfplumber.open(pdf_path) as pdf:
+            for p in pdf.pages:
+                t = p.extract_tables()
+                for tb in t:
+                    if tb:
+                        df=pd.DataFrame(tb)
+                        tables.append(df)
+        return tables
 
+    def extract_tabula(self,pdf_path):
+        if not shutil.which("java"):
+            return []
+        try:
+            return tabula.read_pdf(pdf_path,pages='all',multiple_tables=True)
+        except:
+            return []
 
-# -------------------------------
-# MAIN PIPELINE
-# -------------------------------
-def extract_all_tables(pdf_path):
-    
-    if is_scanned_pdf(pdf_path):
-        tables = extract_tables_ocr(pdf_path)
-    else:
-        tables = []
-        
-        # Try all methods
-        tables += extract_with_camelot(pdf_path)
-        tables += extract_with_pdfplumber(pdf_path)
-    
-    # Clean all tables
-    cleaned_tables = [clean_table(df) for df in tables]
-    
-    # Merge/filter
-    final_tables = merge_tables(cleaned_tables)
-    
-    return final_tables
+    def clean_financial(self,df):
+        df = df.dropna(how='all').dropna(axis=1,how='all')
+        df = df.fillna('')
 
+        def convert(x):
+            if isinstance(x,str):
+                x=x.strip()
+                if x.startswith('(') and x.endswith(')'):
+                    x = '-' + x[1:-1]
+                x=x.replace(',','')
+            return x
 
-# -------------------------------
-# SAVE OUTPUT
-# -------------------------------
-def save_tables(tables):
-    for i, table in enumerate(tables):
-        table.to_csv(f"table_{i}.csv", index=False)
+        df = df.applymap(convert)
+        return df
 
+    def score(self,df):
+        if df.empty: return 0
+        density = (df!='').sum().sum()/(df.shape[0]*df.shape[1])
+        return density
 
-# -------------------------------
-# RUN
-# -------------------------------
+    def dedup(self,tables):
+        unique={}
+        for df in tables:
+            h = hashlib.md5(df.to_csv(index=False).encode()).hexdigest()
+            score = self.score(df)
+            if h not in unique or unique[h][1] < score:
+                unique[h]=(df,score)
+        return [v[0] for v in unique.values()]
+
+    def stitch(self,tables):
+        stitched=[]
+        prev=None
+        for df in tables:
+            if prev is not None and list(df.columns)==list(prev.columns):
+                prev = pd.concat([prev,df])
+            else:
+                if prev is not None:
+                    stitched.append(prev)
+                prev=df
+        if prev is not None:
+            stitched.append(prev)
+        return stitched
+
+    def run(self,pdf_path,output_dir="output"):
+        Path(output_dir).mkdir(exist_ok=True)
+
+        regions = self.detect_regions(pdf_path)
+
+        tables=[]
+        tables += self.extract_camelot(pdf_path,regions)
+        tables += self.extract_pdfplumber(pdf_path)
+        tables += self.extract_tabula(pdf_path)
+
+        tables = [self.clean_financial(t) for t in tables]
+        tables = self.dedup(tables)
+        tables = self.stitch(tables)
+
+        for i,t in enumerate(tables):
+            t.to_csv(f"{output_dir}/table_{i+1}.csv",index=False)
+            print(f"Saved table {i+1} shape={t.shape}")
+
+        print(f"Total tables: {len(tables)}")
+
+# ================= RUN =================
+
 if __name__ == "__main__":
-    tables = extract_all_tables(PDF_PATH)
-    save_tables(tables)
-    print(f"Extracted {len(tables)} tables.")
+    extractor = Extractor()
+    extractor.run("standard-chartered-plc-full-year-2025-press-release.pdf")
