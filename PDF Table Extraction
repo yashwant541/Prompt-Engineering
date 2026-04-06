@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""
+Advanced Multi-Table Extraction from PDFs
+Combines OpenDataLoader, SPARTAN fallback, and LLM validation
+"""
+
+import os
+import json
+import csv
+import pandas as pd
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import fitz  # PyMuPDF
+import cv2
+import numpy as np
+from PIL import Image
+import io
+
+# Install required packages:
+# pip install open-data-loader-pdf pymupdf opencv-python pillow pandas camelot-py[cv] tabula-py pdfplumber
+# pip install spartan-sdk  # For SPARTAN pipeline
+# pip install openai  # For LLM validation
+
+class AdvancedPDFTableExtractor:
+    """Intelligent multi-table extractor with fallback strategies"""
+    
+    def __init__(self, use_llm_validation=False, llm_api_key=None):
+        self.use_llm_validation = use_llm_validation
+        self.extraction_methods = []
+        
+        if use_llm_validation and llm_api_key:
+            import openai
+            self.openai_client = openai.OpenAI(api_key=llm_api_key)
+    
+    def extract_tables(self, pdf_path: str, output_dir: str = "extracted_tables") -> Dict[str, List[pd.DataFrame]]:
+        """
+        Main extraction method with multi-strategy approach
+        
+        Returns:
+            Dictionary with keys: 'tables', 'metadata', 'quality_scores'
+        """
+        pdf_path = Path(pdf_path)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+        
+        results = {
+            'tables': [],
+            'metadata': [],
+            'quality_scores': [],
+            'extraction_method_used': []
+        }
+        
+        print(f"🔍 Processing PDF: {pdf_path.name}")
+        
+        # Strategy 1: Try OpenDataLoader (best for complex layouts)
+        try:
+            tables = self._extract_with_opendataloader(pdf_path)
+            if tables:
+                results['tables'].extend(tables)
+                results['extraction_method_used'].extend(['opendataloader'] * len(tables))
+                print(f"✅ OpenDataLoader extracted {len(tables)} tables")
+        except Exception as e:
+            print(f"⚠️ OpenDataLoader failed: {e}")
+        
+        # Strategy 2: Try Camelot (good for bordered tables)
+        if len(results['tables']) == 0:
+            try:
+                tables = self._extract_with_camelot(pdf_path)
+                if tables:
+                    results['tables'].extend(tables)
+                    results['extraction_method_used'].extend(['camelot'] * len(tables))
+                    print(f"✅ Camelot extracted {len(tables)} tables")
+            except Exception as e:
+                print(f"⚠️ Camelot failed: {e}")
+        
+        # Strategy 3: Try Tabula (good for simple tables)
+        if len(results['tables']) == 0:
+            try:
+                tables = self._extract_with_tabula(pdf_path)
+                if tables:
+                    results['tables'].extend(tables)
+                    results['extraction_method_used'].extend(['tabula'] * len(tables))
+                    print(f"✅ Tabula extracted {len(tables)} tables")
+            except Exception as e:
+                print(f"⚠️ Tabula failed: {e}")
+        
+        # Strategy 4: Fallback to SPARTAN (best for scanned/borderless)
+        if len(results['tables']) == 0:
+            try:
+                tables = self._extract_with_spartan(pdf_path)
+                if tables:
+                    results['tables'].extend(tables)
+                    results['extraction_method_used'].extend(['spartan'] * len(tables))
+                    print(f"✅ SPARTAN extracted {len(tables)} tables")
+            except Exception as e:
+                print(f"⚠️ SPARTAN failed: {e}")
+        
+        # Strategy 5: Manual extraction with PyMuPDF (last resort)
+        if len(results['tables']) == 0:
+            tables = self._manual_extraction_fallback(pdf_path)
+            if tables:
+                results['tables'].extend(tables)
+                results['extraction_method_used'].extend(['manual'] * len(tables))
+                print(f"✅ Manual extraction found {len(tables)} potential tables")
+        
+        # Post-process and validate
+        validated_tables = []
+        for idx, table in enumerate(results['tables']):
+            # Clean the table
+            cleaned_table = self._clean_table(table)
+            
+            # Validate structure
+            quality_score = self._assess_table_quality(cleaned_table)
+            results['quality_scores'].append(quality_score)
+            
+            # Optional LLM validation
+            if self.use_llm_validation and hasattr(self, 'openai_client'):
+                cleaned_table = self._llm_validate_table(
+                    cleaned_table, 
+                    pdf_path, 
+                    idx
+                )
+            
+            validated_tables.append(cleaned_table)
+            
+            # Save individual table
+            self._save_table(
+                cleaned_table, 
+                output_dir, 
+                f"table_{idx+1}_{results['extraction_method_used'][idx]}.csv"
+            )
+            
+            # Add metadata
+            results['metadata'].append({
+                'table_index': idx,
+                'method': results['extraction_method_used'][idx],
+                'quality_score': quality_score,
+                'shape': cleaned_table.shape
+            })
+        
+        results['tables'] = validated_tables
+        
+        # Save summary report
+        self._save_summary_report(results, output_dir, pdf_path.name)
+        
+        return results
+    
+    def _extract_with_opendataloader(self, pdf_path):
+        """Extract tables using OpenDataLoader PDF v2.0"""
+        try:
+            from odlpdf import ODLPDF
+            
+            extractor = ODLPDF()
+            result = extractor.extract_tables(str(pdf_path))
+            
+            tables = []
+            if hasattr(result, 'tables'):
+                for table in result.tables:
+                    df = pd.DataFrame(table.data)
+                    if not df.empty and df.shape[1] > 0:
+                        tables.append(df)
+            return tables
+        except ImportError:
+            print("OpenDataLoader not installed. Skipping...")
+            return []
+    
+    def _extract_with_camelot(self, pdf_path):
+        """Extract tables using Camelot (best for bordered tables)"""
+        import camelot
+        
+        # Try different flavors
+        tables = []
+        
+        # Lattice flavor for bordered tables
+        try:
+            lattice_tables = camelot.read_pdf(str(pdf_path), flavor='lattice', pages='all')
+            for table in lattice_tables:
+                if not table.df.empty and table.df.shape[1] > 0:
+                    tables.append(table.df)
+        except:
+            pass
+        
+        # Stream flavor for borderless tables
+        try:
+            stream_tables = camelot.read_pdf(str(pdf_path), flavor='stream', pages='all')
+            for table in stream_tables:
+                if not table.df.empty and table.df.shape[1] > 0:
+                    tables.append(table.df)
+        except:
+            pass
+        
+        return tables
+    
+    def _extract_with_tabula(self, pdf_path):
+        """Extract tables using Tabula"""
+        import tabula
+        
+        tables = tabula.read_pdf(str(pdf_path), pages='all', multiple_tables=True)
+        return [t for t in tables if not t.empty and t.shape[1] > 0]
+    
+    def _extract_with_spartan(self, pdf_path):
+        """Extract tables using SPARTAN (for challenging cases)"""
+        try:
+            from spartan import SpartanPDF
+            
+            spartan = SpartanPDF()
+            result = spartan.process_document(str(pdf_path))
+            
+            tables = []
+            if hasattr(result, 'tables'):
+                for table in result.tables:
+                    df = pd.DataFrame(table.data)
+                    if not df.empty:
+                        tables.append(df)
+            return tables
+        except ImportError:
+            print("SPARTAN not installed. Skipping...")
+            return []
+    
+    def _manual_extraction_fallback(self, pdf_path):
+        """Manual extraction using PyMuPDF as last resort"""
+        tables = []
+        
+        # Open PDF
+        doc = fitz.open(pdf_path)
+        
+        for page_num, page in enumerate(doc):
+            # Get page text
+            text = page.get_text()
+            
+            # Look for table-like structures
+            lines = text.split('\n')
+            
+            # Find potential tables (consecutive lines with similar structure)
+            potential_table = []
+            for line in lines:
+                # Check if line has multiple columns (tab or multiple spaces)
+                if '\t' in line or '  ' in line:
+                    # Convert to tab-separated
+                    if '\t' not in line:
+                        line = ' '.join(line.split())
+                        line = line.replace('  ', '\t')
+                    
+                    potential_table.append(line)
+                else:
+                    if len(potential_table) > 2:  # At least 2 rows
+                        # Convert to DataFrame
+                        rows = [row.split('\t') for row in potential_table]
+                        max_cols = max(len(r) for r in rows)
+                        # Pad rows
+                        padded_rows = [r + [''] * (max_cols - len(r)) for r in rows]
+                        df = pd.DataFrame(padded_rows)
+                        tables.append(df)
+                    potential_table = []
+        
+        doc.close()
+        return tables
+    
+    def _clean_table(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean and normalize extracted table"""
+        if df.empty:
+            return df
+        
+        # Remove completely empty rows and columns
+        df = df.dropna(how='all')
+        df = df.dropna(axis=1, how='all')
+        
+        # Fill NaN with empty string
+        df = df.fillna('')
+        
+        # Strip whitespace from string cells
+        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        
+        # Try to detect and set header row
+        if len(df) > 0:
+            # Check if first row looks like headers (contains no numbers or short strings)
+            first_row = df.iloc[0].astype(str)
+            if first_row.str.contains(r'^\d+$').any() == False:  # No pure numbers
+                if first_row.str.len().mean() < 30:  # Reasonable length
+                    df.columns = first_row
+                    df = df[1:]
+        
+        return df
+    
+    def _assess_table_quality(self, df: pd.DataFrame) -> float:
+        """Assess quality score of extracted table (0-1)"""
+        if df.empty:
+            return 0.0
+        
+        score = 0.0
+        
+        # Factor 1: Consistency of column counts
+        col_counts = df.apply(lambda row: len(row.dropna()), axis=1)
+        col_consistency = 1 - (col_counts.std() / (col_counts.mean() + 0.01))
+        score += 0.3 * min(1.0, max(0.0, col_consistency))
+        
+        # Factor 2: Data density (non-empty cells)
+        total_cells = df.shape[0] * df.shape[1]
+        non_empty = df.astype(str).applymap(lambda x: len(x) > 0).sum().sum()
+        density = non_empty / total_cells if total_cells > 0 else 0
+        score += 0.3 * density
+        
+        # Factor 3: Structural regularity
+        if df.shape[0] > 1 and df.shape[1] > 1:
+            # Check if columns have consistent data types
+            type_consistency = 0
+            for col in df.columns:
+                is_numeric = pd.to_numeric(df[col], errors='coerce').notna().mean()
+                type_consistency += max(is_numeric, 1 - is_numeric)
+            type_consistency /= len(df.columns)
+            score += 0.4 * type_consistency
+        
+        return score
+    
+    def _llm_validate_table(self, df: pd.DataFrame, pdf_path: Path, table_idx: int) -> pd.DataFrame:
+        """Use LLM to validate and correct table structure"""
+        try:
+            # Convert table to string representation
+            table_str = df.to_csv(index=False)
+            
+            # Truncate if too long
+            if len(table_str) > 8000:
+                table_str = table_str[:8000] + "..."
+            
+            prompt = f"""
+            You are a table validation expert. Analyze this extracted table and:
+            1. Check if rows and columns are properly aligned
+            2. Verify if headers are correctly identified
+            3. Suggest corrections for any misalignments
+            
+            Original table (CSV format):
+            {table_str}
+            
+            Return ONLY the corrected table in CSV format. If no corrections needed, return the original.
+            """
+            
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+            
+            # Parse corrected table
+            corrected_csv = response.choices[0].message.content
+            corrected_df = pd.read_csv(io.StringIO(corrected_csv))
+            
+            return corrected_df
+            
+        except Exception as e:
+            print(f"⚠️ LLM validation failed for table {table_idx}: {e}")
+            return df
+    
+    def _save_table(self, df: pd.DataFrame, output_dir: Path, filename: str):
+        """Save table to multiple formats"""
+        # Save as CSV
+        df.to_csv(output_dir / filename, index=False)
+        
+        # Save as Excel
+        excel_path = output_dir / filename.replace('.csv', '.xlsx')
+        df.to_excel(excel_path, index=False)
+        
+        # Save as JSON
+        json_path = output_dir / filename.replace('.csv', '.json')
+        df.to_json(json_path, orient='records', indent=2)
+    
+    def _save_summary_report(self, results: Dict, output_dir: Path, pdf_name: str):
+        """Save comprehensive extraction report"""
+        report_path = output_dir / f"extraction_report_{pdf_name.replace('.pdf', '')}.json"
+        
+        report = {
+            'source_pdf': pdf_name,
+            'total_tables': len(results['tables']),
+            'extraction_summary': results['metadata'],
+            'average_quality_score': np.mean(results['quality_scores']) if results['quality_scores'] else 0,
+            'methods_used': list(set(results['extraction_method_used']))
+        }
+        
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        # Also save a human-readable summary
+        summary_path = output_dir / f"summary_{pdf_name.replace('.pdf', '')}.txt"
+        with open(summary_path, 'w') as f:
+            f.write(f"PDF Table Extraction Summary\n")
+            f.write(f"=" * 50 + "\n")
+            f.write(f"Source: {pdf_name}\n")
+            f.write(f"Total tables found: {len(results['tables'])}\n")
+            f.write(f"Average quality score: {report['average_quality_score']:.2f}\n\n")
+            
+            for meta in results['metadata']:
+                f.write(f"Table {meta['table_index']+1}:\n")
+                f.write(f"  - Method: {meta['method']}\n")
+                f.write(f"  - Quality: {meta['quality_score']:.2f}\n")
+                f.write(f"  - Shape: {meta['shape']}\n\n")
+
+
+# ============= USAGE EXAMPLES =============
+
+def example_basic_usage():
+    """Simple usage example"""
+    extractor = AdvancedPDFTableExtractor()
+    
+    results = extractor.extract_tables("sample.pdf", output_dir="my_tables")
+    
+    print(f"\n📊 Extraction Complete!")
+    print(f"Found {len(results['tables'])} tables")
+    
+    for i, table in enumerate(results['tables']):
+        print(f"\nTable {i+1}:")
+        print(table.head())
+        print(f"Quality score: {results['quality_scores'][i]:.2f}")
+        print(f"Method: {results['extraction_method_used'][i]}")
+
+
+def example_advanced_with_llm():
+    """Advanced usage with LLM validation"""
+    # Get your API key from environment variable
+    api_key = os.getenv("OPENAI_API_KEY")
+    
+    extractor = AdvancedPDFTableExtractor(
+        use_llm_validation=True,
+        llm_api_key=api_key
+    )
+    
+    results = extractor.extract_tables("complex_financial_report.pdf")
+    
+    # Access individual tables
+    for i, table in enumerate(results['tables']):
+        print(f"\nTable {i} ({results['metadata'][i]['method']}):")
+        print(table.to_string())
+
+
+def example_batch_processing():
+    """Process multiple PDFs"""
+    pdf_folder = Path("pdfs_to_process")
+    output_base = Path("extracted_data")
+    
+    all_results = {}
+    
+    for pdf_path in pdf_folder.glob("*.pdf"):
+        extractor = AdvancedPDFTableExtractor()
+        results = extractor.extract_tables(pdf_path, output_base / pdf_path.stem)
+        all_results[pdf_path.name] = results
+        
+        print(f"\n✅ Processed {pdf_path.name}: {len(results['tables'])} tables found")
+
+
+if __name__ == "__main__":
+    # Run basic example
+    # example_basic_usage()
+    
+    # Or run advanced example
+    # example_advanced_with_llm()
+    
+    print("""
+    Advanced PDF Table Extractor - Setup Instructions:
+    
+    1. Install dependencies:
+       pip install open-data-loader-pdf pymupdf opencv-python pandas camelot-py[cv] tabula-py pdfplumber openai
+    
+    2. For SPARTAN (optional but recommended for complex cases):
+       pip install spartan-sdk
+    
+    3. For LLM validation (optional):
+       export OPENAI_API_KEY="your-key-here"
+    
+    4. Run with your PDF:
+       extractor = AdvancedPDFTableExtractor()
+       results = extractor.extract_tables("your_file.pdf")
+    """)
