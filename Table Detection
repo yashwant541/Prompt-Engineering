@@ -1,538 +1,192 @@
+import camelot
+import pdfplumber
 import pandas as pd
-import openpyxl
-from openpyxl.utils import get_column_letter
 import numpy as np
-from typing import List, Dict, Tuple, Optional, Set
-from collections import defaultdict
-from dataclasses import dataclass
-from enum import Enum
+import re
 
-@dataclass
-class DataBlock:
-    """Represents a consistent data block"""
-    start_row: int
-    end_row: int
-    start_col: int
-    end_col: int
-    consistency_score: float
-    data_type: str  # 'numeric', 'mixed', 'text'
-    row_consistency: float
-    col_consistency: float
+PDF_PATH = "input.pdf"
 
-class ConsistencyBasedDetector:
-    """
-    Detects tables by analyzing data consistency patterns.
-    Tables are characterized by:
-    1. Consistent number of non-empty cells per row
-    2. Consistent data types across rows for same column
-    3. Contiguous blocks of data
-    4. Separator rows (empty or different patterns)
-    """
-    
-    def __init__(self, 
-                 min_rows: int = 3,
-                 min_cols: int = 2,
-                 consistency_threshold: float = 0.8,
-                 max_gap_rows: int = 1):
-        """
-        Parameters:
-        - min_rows: Minimum rows to consider as table
-        - min_cols: Minimum columns to consider as table
-        - consistency_threshold: How consistent rows/columns must be (0-1)
-        - max_gap_rows: Maximum empty rows allowed within table (1 means single empty row allowed)
-        """
-        self.min_rows = min_rows
-        self.min_cols = min_cols
-        self.consistency_threshold = consistency_threshold
-        self.max_gap_rows = max_gap_rows
-    
-    def analyze_row_consistency(self, sheet, row_idx: int, col_range: range) -> Dict:
-        """Analyze consistency of a single row"""
-        row_data = []
-        non_empty_count = 0
-        data_types = []
-        
-        for col_idx in col_range:
-            cell = sheet.cell(row_idx + 1, col_idx).value
-            if cell is not None and str(cell).strip():
-                non_empty_count += 1
-                row_data.append(cell)
-                # Detect data type
-                if isinstance(cell, (int, float)):
-                    data_types.append('numeric')
-                elif isinstance(cell, (str,)):
-                    if re.match(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', str(cell)):
-                        data_types.append('date')
-                    else:
-                        data_types.append('text')
-                else:
-                    data_types.append('other')
-            else:
-                row_data.append(None)
-                data_types.append('empty')
-        
-        # Calculate row metrics
-        total_cols = len(col_range)
-        fill_rate = non_empty_count / total_cols if total_cols > 0 else 0
-        
-        # Determine row type
-        if fill_rate >= 0.7:
-            if data_types.count('numeric') > data_types.count('text'):
-                row_type = 'numeric_row'
-            elif data_types.count('text') > 0:
-                row_type = 'text_row'
-            else:
-                row_type = 'mixed_row'
-        elif fill_rate > 0:
-            row_type = 'sparse_row'
-        else:
-            row_type = 'empty_row'
-        
-        return {
-            'row_idx': row_idx,
-            'non_empty_count': non_empty_count,
-            'fill_rate': fill_rate,
-            'data_types': data_types,
-            'row_type': row_type,
-            'has_data': non_empty_count > 0
-        }
-    
-    def find_consistent_columns(self, sheet, start_row: int, end_row: int) -> List[int]:
-        """
-        Find which columns have consistent data across rows
-        Returns list of column indices that are consistently filled
-        """
-        if start_row > end_row:
-            return []
-        
-        # Analyze each column's consistency
-        col_consistency = {}
-        
-        for col_idx in range(1, min(sheet.max_column + 1, 30)):  # Check first 30 columns
-            fill_counts = []
-            data_types = []
-            
-            for row_idx in range(start_row, end_row + 1):
-                cell = sheet.cell(row_idx + 1, col_idx).value
-                if cell is not None and str(cell).strip():
-                    fill_counts.append(1)
-                    if isinstance(cell, (int, float)):
-                        data_types.append('numeric')
-                    else:
-                        data_types.append('text')
-                else:
-                    fill_counts.append(0)
-                    data_types.append('empty')
-            
-            if fill_counts:
-                # Calculate consistency metrics
-                fill_rate = sum(fill_counts) / len(fill_counts)
-                type_consistency = 0
-                if data_types:
-                    non_empty_types = [t for t in data_types if t != 'empty']
-                    if non_empty_types:
-                        type_consistency = non_empty_types.count(non_empty_types[0]) / len(non_empty_types)
-                
-                # Column is consistent if:
-                # 1. Fill rate > 50% OR
-                # 2. Type consistency > 70%
-                if fill_rate > 0.5 or type_consistency > 0.7:
-                    col_consistency[col_idx] = {
-                        'fill_rate': fill_rate,
-                        'type_consistency': type_consistency,
-                        'score': (fill_rate + type_consistency) / 2
-                    }
-        
-        # Sort columns by consistency score and find contiguous blocks
-        if not col_consistency:
-            return []
-        
-        # Find columns with high consistency
-        consistent_cols = [col for col, data in col_consistency.items() 
-                          if data['score'] >= self.consistency_threshold]
-        
-        if not consistent_cols:
-            # Fallback: take columns with highest scores
-            sorted_cols = sorted(col_consistency.items(), key=lambda x: x[1]['score'], reverse=True)
-            consistent_cols = [col for col, _ in sorted_cols[:self.min_cols]]
-        
-        # Find contiguous column blocks
-        consistent_cols.sort()
-        col_blocks = []
-        current_block = [consistent_cols[0]]
-        
-        for i in range(1, len(consistent_cols)):
-            if consistent_cols[i] == consistent_cols[i-1] + 1:
-                current_block.append(consistent_cols[i])
-            else:
-                if len(current_block) >= self.min_cols:
-                    col_blocks.append(current_block)
-                current_block = [consistent_cols[i]]
-        
-        if len(current_block) >= self.min_cols:
-            col_blocks.append(current_block)
-        
-        # Return the largest contiguous block
-        if col_blocks:
-            return max(col_blocks, key=len)
-        
-        return consistent_cols[:self.min_cols] if consistent_cols else []
-    
-    def find_consistent_row_blocks(self, sheet, col_range: range) -> List[DataBlock]:
-        """
-        Find contiguous blocks of rows that have consistent data patterns
-        Handles gaps (empty rows) within blocks if they're small
-        """
-        row_analyses = []
-        
-        # Analyze each row
-        for row_idx in range(min(500, sheet.max_row)):
-            analysis = self.analyze_row_consistency(sheet, row_idx, col_range)
-            row_analyses.append(analysis)
-        
-        # Group rows into blocks based on consistency
-        blocks = []
-        current_block = []
-        consecutive_empty = 0
-        
-        for i, analysis in enumerate(row_analyses):
-            if analysis['has_data'] or (current_block and consecutive_empty < self.max_gap_rows):
-                # Start new block if needed
-                if not current_block and analysis['has_data']:
-                    current_block = [analysis]
-                    consecutive_empty = 0
-                elif current_block:
-                    # Check if this row is consistent with the block
-                    if self.is_row_consistent_with_block(analysis, current_block, col_range):
-                        current_block.append(analysis)
-                        consecutive_empty = 0 if analysis['has_data'] else consecutive_empty + 1
-                    else:
-                        # End current block and start new one
-                        if len(current_block) >= self.min_rows:
-                            blocks.append(self.create_block_from_rows(current_block, col_range))
-                        current_block = [analysis] if analysis['has_data'] else []
-                        consecutive_empty = 0 if analysis['has_data'] else 1
-            else:
-                # Empty row - might end the block
-                if current_block and consecutive_empty >= self.max_gap_rows:
-                    if len(current_block) >= self.min_rows:
-                        blocks.append(self.create_block_from_rows(current_block, col_range))
-                    current_block = []
-                    consecutive_empty = 0
-                else:
-                    consecutive_empty += 1
-        
-        # Add last block if exists
-        if current_block and len(current_block) >= self.min_rows:
-            blocks.append(self.create_block_from_rows(current_block, col_range))
-        
-        return blocks
-    
-    def is_row_consistent_with_block(self, row_analysis: Dict, block_rows: List[Dict], col_range: range) -> bool:
-        """Check if a row is consistent with existing block"""
-        if not block_rows:
-            return True
-        
-        # Compare with typical row in block
-        typical_row = block_rows[-1]  # Use last row as reference
-        
-        # Check fill rate similarity
-        fill_rate_diff = abs(row_analysis['fill_rate'] - typical_row['fill_rate'])
-        
-        # Check if pattern is similar
-        if row_analysis['has_data']:
-            # For data rows, they should have similar fill rates
-            return fill_rate_diff < 0.3
-        else:
-            # For empty rows, only allow within max_gap_rows
-            return fill_rate_diff < 0.1
-    
-    def create_block_from_rows(self, rows: List[Dict], col_range: range) -> DataBlock:
-        """Create a DataBlock from a list of rows"""
-        start_row = rows[0]['row_idx']
-        end_row = rows[-1]['row_idx']
-        
-        # Calculate block consistency score
-        fill_rates = [r['fill_rate'] for r in rows if r['has_data']]
-        avg_fill_rate = sum(fill_rates) / len(fill_rates) if fill_rates else 0
-        
-        # Calculate row-to-row consistency
-        row_consistency = 1.0
-        if len(rows) > 1:
-            prev_fill = rows[0]['fill_rate']
-            diffs = []
-            for r in rows[1:]:
-                diffs.append(abs(r['fill_rate'] - prev_fill))
-                prev_fill = r['fill_rate']
-            row_consistency = 1 - (sum(diffs) / len(diffs)) if diffs else 1.0
-        
-        # Determine primary data type
-        all_types = []
-        for r in rows:
-            all_types.extend([t for t in r['data_types'] if t != 'empty'])
-        data_type = max(set(all_types), key=all_types.count) if all_types else 'mixed'
-        
-        return DataBlock(
-            start_row=start_row,
-            end_row=end_row,
-            start_col=col_range.start,
-            end_col=col_range.stop - 1,
-            consistency_score=avg_fill_rate * row_consistency,
-            data_type=data_type,
-            row_consistency=row_consistency,
-            col_consistency=1.0  # Will be updated later
-        )
-    
-    def merge_adjacent_blocks(self, blocks: List[DataBlock], sheet, col_range: range) -> List[DataBlock]:
-        """
-        Merge adjacent blocks that have similar column structure
-        (like the Assets and Liabilities sections in balance sheet)
-        """
-        if len(blocks) <= 1:
-            return blocks
-        
-        merged_blocks = []
-        current = blocks[0]
-        
-        for next_block in blocks[1:]:
-            # Check if blocks are adjacent or have small gap
-            gap = next_block.start_row - current.end_row - 1
-            
-            # Check if they share the same column structure
-            same_columns = (current.start_col == next_block.start_col and 
-                           current.end_col == next_block.end_col)
-            
-            # Check if data types are compatible
-            compatible_types = (current.data_type == next_block.data_type or
-                               current.data_type == 'numeric' or next_block.data_type == 'numeric')
-            
-            if gap <= self.max_gap_rows and same_columns and compatible_types:
-                # Merge blocks
-                current = DataBlock(
-                    start_row=current.start_row,
-                    end_row=next_block.end_row,
-                    start_col=current.start_col,
-                    end_col=current.end_col,
-                    consistency_score=(current.consistency_score + next_block.consistency_score) / 2,
-                    data_type=current.data_type if current.data_type == next_block.data_type else 'mixed',
-                    row_consistency=(current.row_consistency + next_block.row_consistency) / 2,
-                    col_consistency=(current.col_consistency + next_block.col_consistency) / 2
-                )
-            else:
-                merged_blocks.append(current)
-                current = next_block
-        
-        merged_blocks.append(current)
-        return merged_blocks
-    
-    def find_header_row(self, sheet, block: DataBlock, col_range: range) -> Optional[int]:
-        """
-        Find header row for a data block (looks for row immediately above with text)
-        """
-        header_candidates = []
-        
-        # Check rows above the block
-        for offset in range(1, 6):  # Check up to 5 rows above
-            header_row = block.start_row - offset
-            if header_row < 0:
-                break
-            
-            # Analyze potential header row
-            header_analysis = self.analyze_row_consistency(sheet, header_row, col_range)
-            
-            # Headers typically have:
-            # 1. Higher proportion of text
-            # 2. Lower fill rate than data rows
-            # 3. Different data type pattern
-            if (header_analysis['row_type'] == 'text_row' or 
-                (header_analysis['fill_rate'] > 0.3 and header_analysis['fill_rate'] < 0.8)):
-                header_candidates.append((header_row, header_analysis))
-        
-        if header_candidates:
-            # Return the closest candidate
-            return header_candidates[0][0]
-        
+
+# -------------------------------
+# STEP 1: Extract using Camelot
+# -------------------------------
+def extract_camelot(pdf_path):
+    tables = []
+
+    try:
+        lattice = camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
+        stream = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
+
+        for t in lattice:
+            tables.append(t.df)
+
+        for t in stream:
+            tables.append(t.df)
+
+    except Exception as e:
+        print("Camelot error:", e)
+
+    return tables
+
+
+# -------------------------------
+# STEP 2: Extract using pdfplumber
+# -------------------------------
+def extract_pdfplumber(pdf_path):
+    tables = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            extracted = page.extract_tables()
+
+            for table in extracted:
+                df = pd.DataFrame(table)
+                tables.append(df)
+
+    return tables
+
+
+# -------------------------------
+# STEP 3: Smart Cleaning
+# -------------------------------
+def clean_table(df):
+    df = df.replace("", np.nan)
+
+    # Drop empty rows/cols
+    df = df.dropna(how='all')
+    df = df.dropna(axis=1, how='all')
+
+    if df.shape[0] == 0:
         return None
-    
-    def extract_table(self, file_path: str, sheet_name: str) -> pd.DataFrame:
-        """
-        Extract table using consistency-based detection
-        """
-        # Load workbook
-        wb = openpyxl.load_workbook(file_path, data_only=True)
-        sheet = wb[sheet_name]
-        
-        print(f"\n🔍 Analyzing consistency patterns for '{sheet_name}'...")
-        
-        # Step 1: Find potential column range
-        # Start by analyzing first 50 rows to find consistent columns
-        initial_row_range = range(min(50, sheet.max_row))
-        
-        # Try different column ranges to find best fit
-        best_col_range = None
-        best_score = 0
-        
-        for start_col in range(1, min(sheet.max_column + 1, 15)):
-            for end_col in range(start_col + self.min_cols - 1, min(start_col + 10, sheet.max_column + 1)):
-                col_range = range(start_col, end_col + 1)
-                
-                # Check consistency across initial rows
-                consistent_cols = self.find_consistent_columns(sheet, 0, min(50, sheet.max_row) - 1)
-                
-                if consistent_cols and len(consistent_cols) >= self.min_cols:
-                    # Score this column range
-                    score = len(consistent_cols) / (end_col - start_col + 1)
-                    if score > best_score:
-                        best_score = score
-                        best_col_range = consistent_cols
-        
-        if not best_col_range:
-            # Fallback: use first N columns with data
-            for col_idx in range(1, min(sheet.max_column + 1, 10)):
-                has_data = False
-                for row_idx in range(min(20, sheet.max_row)):
-                    if sheet.cell(row_idx + 1, col_idx).value is not None:
-                        has_data = True
-                        break
-                if has_data and not best_col_range:
-                    best_col_range = [col_idx]
-                elif has_data and best_col_range and col_idx == best_col_range[-1] + 1:
-                    best_col_range.append(col_idx)
-                elif has_data and best_col_range:
-                    break
-        
-        if not best_col_range or len(best_col_range) < self.min_cols:
-            wb.close()
-            raise ValueError(f"Could not find consistent columns in sheet '{sheet_name}'")
-        
-        col_range = range(best_col_range[0], best_col_range[-1] + 1)
-        print(f"  📊 Detected column range: {get_column_letter(col_range.start)}-{get_column_letter(col_range.stop-1)}")
-        
-        # Step 2: Find consistent row blocks
-        row_blocks = self.find_consistent_row_blocks(sheet, col_range)
-        
-        if not row_blocks:
-            wb.close()
-            raise ValueError(f"No consistent row blocks found in sheet '{sheet_name}'")
-        
-        # Step 3: Merge adjacent blocks with same structure
-        merged_blocks = self.merge_adjacent_blocks(row_blocks, sheet, col_range)
-        
-        print(f"  📊 Found {len(merged_blocks)} consistent data block(s)")
-        for i, block in enumerate(merged_blocks):
-            print(f"    Block {i+1}: Rows {block.start_row+1}-{block.end_row+1}, "
-                  f"Consistency: {block.consistency_score:.2f}, Type: {block.data_type}")
-        
-        # Step 4: Extract all blocks into a single DataFrame
-        all_data = []
-        all_labels = []
-        header_row = None
-        
-        for block in merged_blocks:
-            # Find header for this block
-            block_header = self.find_header_row(sheet, block, col_range)
-            if block_header is not None and header_row is None:
-                header_row = block_header
-                print(f"  📌 Detected header row: {header_row + 1}")
-            
-            # Extract data from block
-            for row_idx in range(block.start_row, block.end_row + 1):
-                # Get row label (first column or column before data)
-                label_col = col_range.start - 1 if col_range.start > 1 else 1
-                label_cell = sheet.cell(row_idx + 1, label_col).value
-                
-                # Clean label
-                if label_cell:
-                    label = str(label_cell).strip()
-                    # Remove prefixes like "V*02", "V*03", etc.
-                    label = re.sub(r'^[A-Z]\*\d+\s*', '', label)
-                    label = re.sub(r'^V\*\d+\s*', '', label)
-                    all_labels.append(label if label else f"Row_{row_idx+1}")
-                else:
-                    all_labels.append(f"Row_{row_idx+1}")
-                
-                # Get data values
-                row_data = []
-                for col_idx in col_range:
-                    cell_value = sheet.cell(row_idx + 1, col_idx).value
-                    row_data.append(cell_value)
-                all_data.append(row_data)
-        
-        # Step 5: Extract headers
-        if header_row is not None:
-            headers = []
-            for col_idx in col_range:
-                header_cell = sheet.cell(header_row + 1, col_idx).value
-                if header_cell is None:
-                    header_cell = f"Col_{get_column_letter(col_idx)}"
-                headers.append(str(header_cell).strip())
-        else:
-            # Generate default headers
-            headers = [f"Column_{i+1}" for i in range(len(col_range))]
-        
-        # Step 6: Create DataFrame
-        df = pd.DataFrame(all_data, columns=headers)
-        df.index = all_labels
-        df.index.name = 'Metric'
-        
-        # Step 7: Clean up
-        # Remove rows that are completely empty
-        df = df.dropna(how='all')
-        
-        # Convert numeric columns
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='ignore')
-        
-        # Remove columns that are completely empty
-        df = df.dropna(axis=1, how='all')
-        
-        wb.close()
-        
-        print(f"  ✅ Extracted table: {len(df)} rows × {len(df.columns)} columns")
-        
-        return df
 
-# Example usage with your specific scenario
+    # Detect header row dynamically
+    header_row = detect_header(df)
+    df.columns = df.iloc[header_row]
+    df = df[header_row + 1:]
+
+    df = df.reset_index(drop=True)
+
+    return df
+
+
+def detect_header(df):
+    # Heuristic: row with most strings (not numbers)
+    scores = []
+
+    for i in range(min(5, len(df))):
+        row = df.iloc[i].astype(str)
+        score = sum([not is_number(x) for x in row])
+        scores.append(score)
+
+    return int(np.argmax(scores))
+
+
+def is_number(x):
+    try:
+        float(str(x).replace(",", "").replace("%", ""))
+        return True
+    except:
+        return False
+
+
+# -------------------------------
+# STEP 4: Remove Junk Tables
+# -------------------------------
+def filter_tables(tables):
+    filtered = []
+
+    for df in tables:
+        if df is None:
+            continue
+
+        # Remove very small tables
+        if df.shape[0] < 2 or df.shape[1] < 2:
+            continue
+
+        # Remove garbage tables
+        if df.isnull().sum().sum() > df.size * 0.6:
+            continue
+
+        filtered.append(df)
+
+    return filtered
+
+
+# -------------------------------
+# STEP 5: Merge Split Tables
+# -------------------------------
+def merge_similar_tables(tables):
+    merged = []
+
+    used = set()
+
+    for i in range(len(tables)):
+        if i in used:
+            continue
+
+        base = tables[i]
+
+        for j in range(i + 1, len(tables)):
+            if j in used:
+                continue
+
+            if list(base.columns) == list(tables[j].columns):
+                base = pd.concat([base, tables[j]])
+                used.add(j)
+
+        merged.append(base)
+
+    return merged
+
+
+# -------------------------------
+# STEP 6: Detect Financial Tables
+# -------------------------------
+def is_financial_table(df):
+    keywords = ["income", "profit", "assets", "liabilities", "$", "%", "revenue"]
+
+    text = " ".join(df.astype(str).values.flatten()).lower()
+
+    return any(k in text for k in keywords)
+
+
+# -------------------------------
+# MAIN PIPELINE
+# -------------------------------
+def extract_tables(pdf_path):
+    tables = []
+
+    # Multi-engine extraction
+    tables += extract_camelot(pdf_path)
+    tables += extract_pdfplumber(pdf_path)
+
+    # Clean
+    tables = [clean_table(t) for t in tables]
+
+    # Filter
+    tables = filter_tables(tables)
+
+    # Merge
+    tables = merge_similar_tables(tables)
+
+    # Optional: Keep only financial tables
+    tables = [t for t in tables if is_financial_table(t)]
+
+    return tables
+
+
+# -------------------------------
+# SAVE OUTPUT
+# -------------------------------
+def save_tables(tables):
+    for i, t in enumerate(tables):
+        t.to_excel(f"table_{i}.xlsx", index=False)
+
+
+# -------------------------------
+# RUN
+# -------------------------------
 if __name__ == "__main__":
-    # Initialize detector
-    detector = ConsistencyBasedDetector(
-        min_rows=2,           # Minimum 2 rows for a table
-        min_cols=2,           # Minimum 2 columns
-        consistency_threshold=0.7,  # 70% consistency required
-        max_gap_rows=1        # Allow 1 empty row within table
-    )
-    
-    # Extract table
-    file_path = "Dummy_Financials.xlsx"
-    
-    # For Income Statement
-    print("\n" + "="*80)
-    print("EXTRACTING INCOME STATEMENT")
-    print("="*80)
-    try:
-        df_income = detector.extract_table(file_path, "Income Statement")
-        print("\n📊 Extracted Income Statement:")
-        print(df_income)
-        print(f"\nShape: {df_income.shape}")
-        
-        # Save to CSV
-        df_income.to_csv("income_statement_consistency_based.csv")
-        print("\n✓ Saved to income_statement_consistency_based.csv")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # For Balance Sheet
-    print("\n" + "="*80)
-    print("EXTRACTING BALANCE SHEET")
-    print("="*80)
-    try:
-        df_balance = detector.extract_table(file_path, "Balance Sheet")
-        print("\n📊 Extracted Balance Sheet:")
-        print(df_balance)
-        print(f"\nShape: {df_balance.shape}")
-        
-        # Save to CSV
-        df_balance.to_csv("balance_sheet_consistency_based.csv")
-        print("\n✓ Saved to balance_sheet_consistency_based.csv")
-    except Exception as e:
-        print(f"Error: {e}")
+    tables = extract_tables(PDF_PATH)
+    save_tables(tables)
+    print(f"Extracted {len(tables)} high-quality tables.")
