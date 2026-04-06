@@ -1,0 +1,162 @@
+import pdfplumber
+import camelot
+import pandas as pd
+import pytesseract
+from pdf2image import convert_from_path
+import numpy as np
+import re
+
+# -------------------------------
+# CONFIG
+# -------------------------------
+PDF_PATH = "input.pdf"
+OCR_DPI = 300
+
+
+# -------------------------------
+# STEP 1: Detect if PDF is scanned
+# -------------------------------
+def is_scanned_pdf(pdf_path):
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages[:3]:
+            if page.extract_text():
+                return False
+    return True
+
+
+# -------------------------------
+# STEP 2: OCR Extraction (Fallback)
+# -------------------------------
+def extract_tables_ocr(pdf_path):
+    print("Using OCR pipeline...")
+    images = convert_from_path(pdf_path, dpi=OCR_DPI)
+    
+    tables = []
+    
+    for i, img in enumerate(images):
+        text = pytesseract.image_to_string(img)
+        
+        # Basic table detection via line splitting
+        lines = text.split("\n")
+        rows = [re.split(r"\s{2,}", line.strip()) for line in lines if line.strip()]
+        
+        df = pd.DataFrame(rows)
+        tables.append(df)
+    
+    return tables
+
+
+# -------------------------------
+# STEP 3: Camelot Extraction
+# -------------------------------
+def extract_with_camelot(pdf_path):
+    print("Using Camelot...")
+    
+    tables = []
+    
+    try:
+        tables_lattice = camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
+        tables_stream = camelot.read_pdf(pdf_path, pages='all', flavor='stream')
+        
+        for t in tables_lattice:
+            tables.append(t.df)
+        
+        for t in tables_stream:
+            tables.append(t.df)
+            
+    except Exception as e:
+        print("Camelot failed:", e)
+    
+    return tables
+
+
+# -------------------------------
+# STEP 4: pdfplumber Extraction
+# -------------------------------
+def extract_with_pdfplumber(pdf_path):
+    print("Using pdfplumber...")
+    
+    tables = []
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            extracted = page.extract_tables()
+            
+            for table in extracted:
+                df = pd.DataFrame(table)
+                tables.append(df)
+    
+    return tables
+
+
+# -------------------------------
+# STEP 5: Smart Cleaning
+# -------------------------------
+def clean_table(df):
+    df = df.replace("", np.nan)
+    
+    # Drop empty rows/columns
+    df = df.dropna(how='all')
+    df = df.dropna(axis=1, how='all')
+    
+    # Fix header if first row looks like header
+    if df.shape[0] > 1:
+        df.columns = df.iloc[0]
+        df = df[1:]
+    
+    df.reset_index(drop=True, inplace=True)
+    
+    return df
+
+
+# -------------------------------
+# STEP 6: Merge Similar Tables
+# -------------------------------
+def merge_tables(tables):
+    merged = []
+    
+    for df in tables:
+        if df.shape[1] > 1:
+            merged.append(df)
+    
+    return merged
+
+
+# -------------------------------
+# MAIN PIPELINE
+# -------------------------------
+def extract_all_tables(pdf_path):
+    
+    if is_scanned_pdf(pdf_path):
+        tables = extract_tables_ocr(pdf_path)
+    else:
+        tables = []
+        
+        # Try all methods
+        tables += extract_with_camelot(pdf_path)
+        tables += extract_with_pdfplumber(pdf_path)
+    
+    # Clean all tables
+    cleaned_tables = [clean_table(df) for df in tables]
+    
+    # Merge/filter
+    final_tables = merge_tables(cleaned_tables)
+    
+    return final_tables
+
+
+# -------------------------------
+# SAVE OUTPUT
+# -------------------------------
+def save_tables(tables):
+    for i, table in enumerate(tables):
+        table.to_csv(f"table_{i}.csv", index=False)
+
+
+# -------------------------------
+# RUN
+# -------------------------------
+if __name__ == "__main__":
+    tables = extract_all_tables(PDF_PATH)
+    save_tables(tables)
+    print(f"Extracted {len(tables)} tables.")
