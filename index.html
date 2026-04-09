@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Python Code Analyzer & Comparator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab-btn {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+
+        .tab-btn.active {
+            background: white;
+            color: #667eea;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        .card h2 {
+            color: #333;
+            margin-bottom: 15px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 8px;
+        }
+
+        .upload-area {
+            border: 2px dashed #667eea;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            margin-bottom: 20px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .upload-area:hover {
+            background: #f0f0ff;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 300px;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            resize: vertical;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+            margin-top: 10px;
+        }
+
+        button:hover {
+            background: #5a67d8;
+            transform: translateY(-2px);
+        }
+
+        .structure-view {
+            background: #f7f7f7;
+            padding: 15px;
+            border-radius: 8px;
+            overflow-x: auto;
+        }
+
+        .function-item, .class-item {
+            background: white;
+            padding: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #667eea;
+            border-radius: 4px;
+        }
+
+        .function-name {
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .line-count {
+            color: #666;
+            font-size: 12px;
+        }
+
+        .diff-added {
+            background: #d4edda;
+            color: #155724;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+        }
+
+        .diff-removed {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+        }
+
+        .diff-modified {
+            background: #fff3cd;
+            color: #856404;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 4px;
+        }
+
+        .two-columns {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .code-section {
+            margin-bottom: 20px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: bold;
+        }
+
+        .stat-label {
+            font-size: 14px;
+            margin-top: 5px;
+            opacity: 0.9;
+        }
+
+        .alert {
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Python Code Analyzer & Comparator</h1>
+        
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('analyze')">📊 Analyze Single File</button>
+            <button class="tab-btn" onclick="switchTab('compare')">🔄 Compare Two Versions</button>
+        </div>
+
+        <!-- Analyze Tab -->
+        <div id="analyze-tab" class="tab-content active">
+            <div class="card">
+                <h2>Upload or Paste Python Code</h2>
+                <div class="upload-area" onclick="document.getElementById('file-input').click()">
+                    <p>📁 Click to upload a Python file (PDF/TXT/Text files will be processed as code)</p>
+                    <input type="file" id="file-input" accept=".py,.txt,.pdf" style="display: none" onchange="handleFileUpload(event)">
+                </div>
+                <textarea id="code-input" placeholder="Or paste your Python code here..."></textarea>
+                <button onclick="analyzeCode()">Analyze Code</button>
+            </div>
+
+            <div id="analysis-result" style="display: none;">
+                <div class="card">
+                    <h2>📈 Code Statistics</h2>
+                    <div class="stats" id="stats-container"></div>
+                </div>
+
+                <div class="card">
+                    <h2>🔧 Functions</h2>
+                    <div id="functions-list" class="structure-view"></div>
+                </div>
+
+                <div class="card">
+                    <h2>📦 Classes</h2>
+                    <div id="classes-list" class="structure-view"></div>
+                </div>
+
+                <div class="card">
+                    <h2>📚 Imports</h2>
+                    <div id="imports-list" class="structure-view"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Compare Tab -->
+        <div id="compare-tab" class="tab-content">
+            <div class="two-columns">
+                <div class="code-section">
+                    <div class="card">
+                        <h2>Version 1 (Original)</h2>
+                        <textarea id="code1-input" placeholder="Paste original Python code here..."></textarea>
+                        <button onclick="loadExample1()">Load Example</button>
+                    </div>
+                </div>
+                <div class="code-section">
+                    <div class="card">
+                        <h2>Version 2 (New Version)</h2>
+                        <textarea id="code2-input" placeholder="Paste new Python code here..."></textarea>
+                        <button onclick="loadExample2()">Load Example</button>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <button onclick="compareCodes()" style="width: 100%;">Compare Codes</button>
+            </div>
+
+            <div id="comparison-result" style="display: none;">
+                <div class="card">
+                    <h2>📊 Comparison Summary</h2>
+                    <div id="comparison-summary"></div>
+                </div>
+
+                <div class="card">
+                    <h2>➕ Functions Added</h2>
+                    <div id="functions-added"></div>
+                </div>
+
+                <div class="card">
+                    <h2>➖ Functions Removed</h2>
+                    <div id="functions-removed"></div>
+                </div>
+
+                <div class="card">
+                    <h2>✏️ Functions Modified</h2>
+                    <div id="functions-modified"></div>
+                </div>
+
+                <div class="card">
+                    <h2>📦 Classes Changes</h2>
+                    <div id="classes-changes"></div>
+                </div>
+
+                <div class="card">
+                    <h2>📚 Import Changes</h2>
+                    <div id="imports-changes"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            document.getElementById(`${tab}-tab`).classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    document.getElementById('code-input').value = e.target.result;
+                };
+                reader.readAsText(file);
+            }
+        }
+
+        async function analyzeCode() {
+            const code = document.getElementById('code-input').value;
+            if (!code.trim()) {
+                alert('Please enter some Python code or upload a file');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('code', code);
+
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    displayAnalysis(data.structure);
+                    document.getElementById('analysis-result').style.display = 'block';
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (error) {
+                alert('Error analyzing code: ' + error.message);
+            }
+        }
+
+        function displayAnalysis(structure) {
+            // Display statistics
+            const statsHtml = `
+                <div class="stat-card">
+                    <div class="stat-value">${structure.total_lines}</div>
+                    <div class="stat-label">Total Lines</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${structure.functions.length}</div>
+                    <div class="stat-label">Functions</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${structure.classes.length}</div>
+                    <div class="stat-label">Classes</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${structure.global_code_lines}</div>
+                    <div class="stat-label">Global Code Lines</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${structure.imports.length}</div>
+                    <div class="stat-label">Imports</div>
+                </div>
+            `;
+            document.getElementById('stats-container').innerHTML = statsHtml;
+
+            // Display functions
+            let functionsHtml = '';
+            structure.functions.forEach(func => {
+                functionsHtml += `
+                    <div class="function-item">
+                        <div class="function-name">🔧 ${func.name}(${func.args.join(', ')})</div>
+                        <div class="line-count">Lines: ${func.line_count} (${func.start_line}-${func.end_line})</div>
+                        ${func.decorators.length ? `<div class="line-count">Decorators: ${func.decorators.join(', ')}</div>` : ''}
+                    </div>
+                `;
+            });
+            document.getElementById('functions-list').innerHTML = functionsHtml || '<p>No functions found</p>';
+
+            // Display classes
+            let classesHtml = '';
+            structure.classes.forEach(cls => {
+                classesHtml += `
+                    <div class="class-item">
+                        <div class="function-name">📦 ${cls.name}</div>
+                        <div class="line-count">Lines: ${cls.line_count} (${cls.start_line}-${cls.end_line})</div>
+                        <div class="line-count">Methods: ${cls.methods.join(', ') || 'None'}</div>
+                    </div>
+                `;
+            });
+            document.getElementById('classes-list').innerHTML = classesHtml || '<p>No classes found</p>';
+
+            // Display imports
+            let importsHtml = '<ul>';
+            structure.imports.forEach(imp => {
+                importsHtml += `<li>${imp}</li>`;
+            });
+            importsHtml += '</ul>';
+            document.getElementById('imports-list').innerHTML = importsHtml || '<p>No imports found</p>';
+        }
+
+        async function compareCodes() {
+            const code1 = document.getElementById('code1-input').value;
+            const code2 = document.getElementById('code2-input').value;
+
+            if (!code1.trim() || !code2.trim()) {
+                alert('Please enter both code versions');
+                return;
+            }
+
+            try {
+                const response = await fetch('/compare', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ code1, code2 })
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    displayComparison(data.differences, data.code1_structure, data.code2_structure);
+                    document.getElementById('comparison-result').style.display = 'block';
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (error) {
+                alert('Error comparing codes: ' + error.message);
+            }
+        }
+
+        function displayComparison(diff, structure1, structure2) {
+            // Summary
+            const summaryHtml = `
+                <div class="stats">
+                    <div class="stat-card">
+                        <div class="stat-value">${structure1.total_lines} → ${structure2.total_lines}</div>
+                        <div class="stat-label">Total Lines (${diff.total_lines.difference > 0 ? '+' : ''}${diff.total_lines.difference})</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${diff.functions_added.length}</div>
+                        <div class="stat-label">Functions Added</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${diff.functions_removed.length}</div>
+                        <div class="stat-label">Functions Removed</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${diff.functions_modified.length}</div>
+                        <div class="stat-label">Functions Modified</div>
+                    </div>
+                </div>
+            `;
+            document.getElementById('comparison-summary').innerHTML = summaryHtml;
+
+            // Functions added
+            let addedHtml = '';
+            diff.functions_added.forEach(func => {
+                addedHtml += `<div class="diff-added">➕ ${func.name}() - ${func.line_count} lines (lines ${func.start_line}-${func.end_line})</div>`;
+            });
+            document.getElementById('functions-added').innerHTML = addedHtml || '<p>No functions added</p>';
+
+            // Functions removed
+            let removedHtml = '';
+            diff.functions_removed.forEach(func => {
+                removedHtml += `<div class="diff-removed">➖ ${func.name}() - ${func.line_count} lines (lines ${func.start_line}-${func.end_line})</div>`;
+            });
+            document.getElementById('functions-removed').innerHTML = removedHtml || '<p>No functions removed</p>';
+
+            // Functions modified
+            let modifiedHtml = '';
+            diff.functions_modified.forEach(func => {
+                const changeSymbol = func.difference > 0 ? '+' : '';
+                modifiedHtml += `
+                    <div class="diff-modified">
+                        ✏️ ${func.name}() - ${func.old_lines} → ${func.new_lines} lines (${changeSymbol}${func.difference})
+                    </div>
+                `;
+            });
+            document.getElementById('functions-modified').innerHTML = modifiedHtml || '<p>No functions modified</p>';
+
+            // Classes changes
+            let classesHtml = '';
+            diff.classes_added.forEach(cls => {
+                classesHtml += `<div class="diff-added">➕ Class ${cls.name} - ${cls.line_count} lines</div>`;
+            });
+            diff.classes_removed.forEach(cls => {
+                classesHtml += `<div class="diff-removed">➖ Class ${cls.name} - ${cls.line_count} lines</div>`;
+            });
+            diff.classes_modified.forEach(cls => {
+                const changeSymbol = cls.difference > 0 ? '+' : '';
+                classesHtml += `<div class="diff-modified">✏️ Class ${cls.name} - ${cls.old_lines} → ${cls.new_lines} lines (${changeSymbol}${cls.difference})</div>`;
+            });
+            document.getElementById('classes-changes').innerHTML = classesHtml || '<p>No class changes</p>';
+
+            // Import changes
+            let importsHtml = '';
+            diff.imports_added.forEach(imp => {
+                importsHtml += `<div class="diff-added">➕ ${imp}</div>`;
+            });
+            diff.imports_removed.forEach(imp => {
+                importsHtml += `<div class="diff-removed">➖ ${imp}</div>`;
+            });
+            document.getElementById('imports-changes').innerHTML = importsHtml || '<p>No import changes</p>';
+        }
+
+        function loadExample1() {
+            document.getElementById('code1-input').value = `def process_data(data):
+    # Process the input data
+    result = []
+    for item in data:
+        processed = item * 2
+        result.append(processed)
+    return result
+
+def save_output(result, filename):
+    # Save results to file
+    with open(filename, 'w') as f:
+        for item in result:
+            f.write(str(item) + '\\n')
+    print(f"Saved to {filename}")
+
+class DataProcessor:
+    def __init__(self):
+        self.data = []
+    
+    def load(self, filename):
+        with open(filename, 'r') as f:
+            self.data = [int(line.strip()) for line in f]
+    
+    def process(self):
+        return process_data(self.data)`;
+        }
+
+        function loadExample2() {
+            document.getElementById('code2-input').value = `def process_data_optimized(data):
+    # Optimized processing with list comprehension
+    return [item * 2 for item in data]
+
+def save_output(result, filename, mode='w'):
+    # Save results to file with optional mode
+    with open(filename, mode) as f:
+        for item in result:
+            f.write(str(item) + '\\n')
+    print(f"Saved to {filename}")
+
+def validate_data(data):
+    # New validation function
+    if not data:
+        raise ValueError("Empty data provided")
+    return all(isinstance(x, (int, float)) for x in data)
+
+class DataProcessor:
+    def __init__(self, name="Processor"):
+        self.data = []
+        self.name = name
+    
+    def load(self, filename):
+        with open(filename, 'r') as f:
+            self.data = [int(line.strip()) for line in f]
+        print(f"Loaded {len(self.data)} items")
+    
+    def process(self):
+        if not validate_data(self.data):
+            return []
+        return process_data_optimized(self.data)
+    
+    def get_stats(self):
+        # New method
+        return {
+            'count': len(self.data),
+            'sum': sum(self.data),
+            'avg': sum(self.data) / len(self.data) if self.data else 0
+        }`;
+        }
+    </script>
+</body>
+</html>
