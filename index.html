@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Python Code Analyzer & Comparator</title>
+    <title>Python Code Analyzer & Comparator - With Function Revert</title>
     <style>
         * {
             margin: 0;
@@ -19,7 +19,7 @@
         }
 
         .container {
-            max-width: 1400px;
+            max-width: 1600px;
             margin: 0 auto;
         }
 
@@ -34,6 +34,7 @@
             display: flex;
             gap: 10px;
             margin-bottom: 20px;
+            flex-wrap: wrap;
         }
 
         .tab-btn {
@@ -73,6 +74,10 @@
             margin-bottom: 15px;
             border-bottom: 2px solid #667eea;
             padding-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
         }
 
         .upload-area {
@@ -142,38 +147,155 @@
             font-size: 12px;
         }
 
-        .diff-added {
-            background: #d4edda;
-            color: #155724;
-            padding: 10px;
-            margin: 5px 0;
-            border-radius: 4px;
-        }
-
-        .diff-removed {
-            background: #f8d7da;
-            color: #721c24;
-            padding: 10px;
-            margin: 5px 0;
-            border-radius: 4px;
-        }
-
-        .diff-modified {
+        .modified-function-card {
             background: #fff3cd;
-            color: #856404;
-            padding: 10px;
-            margin: 5px 0;
-            border-radius: 4px;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 8px;
+            transition: all 0.3s;
         }
 
-        .two-columns {
+        .modified-function-card.reverted {
+            background: #d4edda;
+            border-left-color: #28a745;
+            opacity: 0.7;
+        }
+
+        .function-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-bottom: 10px;
+        }
+
+        .function-info {
+            flex: 1;
+        }
+
+        .function-name-large {
+            font-size: 18px;
+            font-weight: bold;
+            color: #856404;
+        }
+
+        .line-change {
+            font-size: 14px;
+            color: #666;
+            margin-top: 5px;
+        }
+
+        .line-increase {
+            color: #dc3545;
+        }
+
+        .line-decrease {
+            color: #28a745;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn-revert {
+            background: #ff9800;
+        }
+
+        .btn-revert:hover {
+            background: #f57c00;
+        }
+
+        .btn-view-diff {
+            background: #17a2b8;
+        }
+
+        .btn-view-diff:hover {
+            background: #138496;
+        }
+
+        .btn-reverted {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+
+        .btn-reverted:hover {
+            transform: none;
+        }
+
+        .diff-container {
+            display: none;
+            margin-top: 15px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 6px;
+            border: 1px solid #dee2e6;
+        }
+
+        .diff-container.show {
+            display: block;
+        }
+
+        .code-diff {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 20px;
+            gap: 15px;
+            margin-bottom: 15px;
         }
 
-        .code-section {
-            margin-bottom: 20px;
+        .code-original, .code-modified {
+            background: white;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+
+        .code-original pre, .code-modified pre {
+            margin: 0;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .code-original {
+            border-left: 3px solid #28a745;
+        }
+
+        .code-modified {
+            border-left: 3px solid #dc3545;
+        }
+
+        .diff-unified {
+            background: white;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+
+        .badge-reverted {
+            background: #28a745;
+            color: white;
+        }
+
+        .badge-pending {
+            background: #ffc107;
+            color: #000;
         }
 
         .stats {
@@ -208,16 +330,77 @@
             margin-bottom: 15px;
         }
 
-        .alert-error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-
         .alert-success {
             background: #d4edda;
             color: #155724;
             border: 1px solid #c3e6cb;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #28a745;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 8px;
+            z-index: 1000;
+            display: none;
+            animation: slideIn 0.3s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+
+        .modal-content {
+            background-color: white;
+            margin: 5% auto;
+            padding: 20px;
+            border-radius: 12px;
+            width: 80%;
+            max-width: 900px;
+            max-height: 80%;
+            overflow-y: auto;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 4px;
+            background: #e0e0e0;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: #28a745;
+            transition: width 0.3s;
+        }
+
+        .two-columns {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
         }
     </style>
 </head>
@@ -227,7 +410,7 @@
         
         <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('analyze')">📊 Analyze Single File</button>
-            <button class="tab-btn" onclick="switchTab('compare')">🔄 Compare Two Versions</button>
+            <button class="tab-btn" onclick="switchTab('compare')">🔄 Compare & Revert Functions</button>
         </div>
 
         <!-- Analyze Tab -->
@@ -235,8 +418,8 @@
             <div class="card">
                 <h2>Upload or Paste Python Code</h2>
                 <div class="upload-area" onclick="document.getElementById('file-input').click()">
-                    <p>📁 Click to upload a Python file (PDF/TXT/Text files will be processed as code)</p>
-                    <input type="file" id="file-input" accept=".py,.txt,.pdf" style="display: none" onchange="handleFileUpload(event)">
+                    <p>📁 Click to upload a Python file</p>
+                    <input type="file" id="file-input" accept=".py,.txt" style="display: none" onchange="handleFileUpload(event)">
                 </div>
                 <textarea id="code-input" placeholder="Or paste your Python code here..."></textarea>
                 <button onclick="analyzeCode()">Analyze Code</button>
@@ -251,16 +434,6 @@
                 <div class="card">
                     <h2>🔧 Functions</h2>
                     <div id="functions-list" class="structure-view"></div>
-                </div>
-
-                <div class="card">
-                    <h2>📦 Classes</h2>
-                    <div id="classes-list" class="structure-view"></div>
-                </div>
-
-                <div class="card">
-                    <h2>📚 Imports</h2>
-                    <div id="imports-list" class="structure-view"></div>
                 </div>
             </div>
         </div>
@@ -277,14 +450,14 @@
                 </div>
                 <div class="code-section">
                     <div class="card">
-                        <h2>Version 2 (New Version)</h2>
-                        <textarea id="code2-input" placeholder="Paste new Python code here..."></textarea>
+                        <h2>Version 2 (Modified)</h2>
+                        <textarea id="code2-input" placeholder="Paste modified Python code here..."></textarea>
                         <button onclick="loadExample2()">Load Example</button>
                     </div>
                 </div>
             </div>
             <div class="card">
-                <button onclick="compareCodes()" style="width: 100%;">Compare Codes</button>
+                <button onclick="compareCodes()" style="width: 100%;">🔍 Compare Codes</button>
             </div>
 
             <div id="comparison-result" style="display: none;">
@@ -294,34 +467,28 @@
                 </div>
 
                 <div class="card">
-                    <h2>➕ Functions Added</h2>
-                    <div id="functions-added"></div>
-                </div>
-
-                <div class="card">
-                    <h2>➖ Functions Removed</h2>
-                    <div id="functions-removed"></div>
-                </div>
-
-                <div class="card">
-                    <h2>✏️ Functions Modified</h2>
-                    <div id="functions-modified"></div>
-                </div>
-
-                <div class="card">
-                    <h2>📦 Classes Changes</h2>
-                    <div id="classes-changes"></div>
-                </div>
-
-                <div class="card">
-                    <h2>📚 Import Changes</h2>
-                    <div id="imports-changes"></div>
+                    <h2>
+                        <span>✏️ Modified Functions</span>
+                        <div>
+                            <button id="revert-all-btn" class="btn-revert" onclick="revertAllFunctions()" style="display: none;">
+                                ↩️ Revert All Modified Functions
+                            </button>
+                        </div>
+                    </h2>
+                    <div id="functions-modified-list"></div>
                 </div>
             </div>
         </div>
     </div>
 
+    <div id="toast" class="toast"></div>
+
     <script>
+        let currentOriginalCode = '';
+        let currentModifiedCode = '';
+        let currentModifiedFunctions = [];
+        let revertedFunctions = new Set();
+
         function switchTab(tab) {
             document.querySelectorAll('.tab-content').forEach(content => {
                 content.classList.remove('active');
@@ -348,7 +515,7 @@
         async function analyzeCode() {
             const code = document.getElementById('code-input').value;
             if (!code.trim()) {
-                alert('Please enter some Python code or upload a file');
+                alert('Please enter some Python code');
                 return;
             }
 
@@ -369,12 +536,11 @@
                     alert('Error: ' + data.error);
                 }
             } catch (error) {
-                alert('Error analyzing code: ' + error.message);
+                alert('Error: ' + error.message);
             }
         }
 
         function displayAnalysis(structure) {
-            // Display statistics
             const statsHtml = `
                 <div class="stat-card">
                     <div class="stat-value">${structure.total_lines}</div>
@@ -389,49 +555,22 @@
                     <div class="stat-label">Classes</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">${structure.global_code_lines}</div>
-                    <div class="stat-label">Global Code Lines</div>
-                </div>
-                <div class="stat-card">
                     <div class="stat-value">${structure.imports.length}</div>
                     <div class="stat-label">Imports</div>
                 </div>
             `;
             document.getElementById('stats-container').innerHTML = statsHtml;
 
-            // Display functions
             let functionsHtml = '';
             structure.functions.forEach(func => {
                 functionsHtml += `
                     <div class="function-item">
                         <div class="function-name">🔧 ${func.name}(${func.args.join(', ')})</div>
                         <div class="line-count">Lines: ${func.line_count} (${func.start_line}-${func.end_line})</div>
-                        ${func.decorators.length ? `<div class="line-count">Decorators: ${func.decorators.join(', ')}</div>` : ''}
                     </div>
                 `;
             });
             document.getElementById('functions-list').innerHTML = functionsHtml || '<p>No functions found</p>';
-
-            // Display classes
-            let classesHtml = '';
-            structure.classes.forEach(cls => {
-                classesHtml += `
-                    <div class="class-item">
-                        <div class="function-name">📦 ${cls.name}</div>
-                        <div class="line-count">Lines: ${cls.line_count} (${cls.start_line}-${cls.end_line})</div>
-                        <div class="line-count">Methods: ${cls.methods.join(', ') || 'None'}</div>
-                    </div>
-                `;
-            });
-            document.getElementById('classes-list').innerHTML = classesHtml || '<p>No classes found</p>';
-
-            // Display imports
-            let importsHtml = '<ul>';
-            structure.imports.forEach(imp => {
-                importsHtml += `<li>${imp}</li>`;
-            });
-            importsHtml += '</ul>';
-            document.getElementById('imports-list').innerHTML = importsHtml || '<p>No imports found</p>';
         }
 
         async function compareCodes() {
@@ -442,6 +581,10 @@
                 alert('Please enter both code versions');
                 return;
             }
+
+            currentOriginalCode = code1;
+            currentModifiedCode = code2;
+            revertedFunctions.clear();
 
             try {
                 const response = await fetch('/compare', {
@@ -454,18 +597,19 @@
                 const data = await response.json();
 
                 if (data.success) {
-                    displayComparison(data.differences, data.code1_structure, data.code2_structure);
+                    currentModifiedFunctions = data.differences.functions_modified;
+                    displayModifiedFunctions(data.differences.functions_modified);
+                    displayComparisonSummary(data.differences, data.code1_structure, data.code2_structure);
                     document.getElementById('comparison-result').style.display = 'block';
                 } else {
                     alert('Error: ' + data.error);
                 }
             } catch (error) {
-                alert('Error comparing codes: ' + error.message);
+                alert('Error: ' + error.message);
             }
         }
 
-        function displayComparison(diff, structure1, structure2) {
-            // Summary
+        function displayComparisonSummary(diff, structure1, structure2) {
             const summaryHtml = `
                 <div class="stats">
                     <div class="stat-card">
@@ -487,126 +631,422 @@
                 </div>
             `;
             document.getElementById('comparison-summary').innerHTML = summaryHtml;
+        }
 
-            // Functions added
-            let addedHtml = '';
-            diff.functions_added.forEach(func => {
-                addedHtml += `<div class="diff-added">➕ ${func.name}() - ${func.line_count} lines (lines ${func.start_line}-${func.end_line})</div>`;
-            });
-            document.getElementById('functions-added').innerHTML = addedHtml || '<p>No functions added</p>';
+        function displayModifiedFunctions(modifiedFunctions) {
+            const container = document.getElementById('functions-modified-list');
+            
+            if (!modifiedFunctions || modifiedFunctions.length === 0) {
+                container.innerHTML = '<div class="alert alert-success">✅ No modified functions detected!</div>';
+                document.getElementById('revert-all-btn').style.display = 'none';
+                return;
+            }
 
-            // Functions removed
-            let removedHtml = '';
-            diff.functions_removed.forEach(func => {
-                removedHtml += `<div class="diff-removed">➖ ${func.name}() - ${func.line_count} lines (lines ${func.start_line}-${func.end_line})</div>`;
-            });
-            document.getElementById('functions-removed').innerHTML = removedHtml || '<p>No functions removed</p>';
-
-            // Functions modified
-            let modifiedHtml = '';
-            diff.functions_modified.forEach(func => {
+            document.getElementById('revert-all-btn').style.display = 'inline-block';
+            
+            let html = '<div class="progress-bar" id="revert-progress-bar" style="display: none;"><div class="progress-fill" id="revert-progress-fill"></div></div>';
+            
+            modifiedFunctions.forEach((func, index) => {
+                const isReverted = revertedFunctions.has(func.name);
+                const changeType = func.difference > 0 ? 'increased' : 'decreased';
+                const changeClass = func.difference > 0 ? 'line-increase' : 'line-decrease';
                 const changeSymbol = func.difference > 0 ? '+' : '';
-                modifiedHtml += `
-                    <div class="diff-modified">
-                        ✏️ ${func.name}() - ${func.old_lines} → ${func.new_lines} lines (${changeSymbol}${func.difference})
+                
+                html += `
+                    <div class="modified-function-card" id="func-card-${func.name}" data-reverted="${isReverted}">
+                        <div class="function-header">
+                            <div class="function-info">
+                                <div class="function-name-large">
+                                    ✏️ ${func.name}()
+                                    ${isReverted ? '<span class="badge badge-reverted">✓ Reverted</span>' : '<span class="badge badge-pending">Pending</span>'}
+                                </div>
+                                <div class="line-change">
+                                    Lines: ${func.old_lines} → ${func.new_lines} 
+                                    <span class="${changeClass}">(${changeSymbol}${func.difference} lines ${changeType})</span>
+                                </div>
+                            </div>
+                            <div class="button-group">
+                                <button class="btn-view-diff" onclick="toggleDiff('${func.name}')" ${isReverted ? 'disabled' : ''}>
+                                    👁️ View Changes
+                                </button>
+                                <button class="btn-revert" id="revert-btn-${func.name}" onclick="confirmRevert('${func.name}')" ${isReverted ? 'disabled' : ''}>
+                                    ${isReverted ? '✓ Reverted' : '↩️ Revert to Original'}
+                                </button>
+                            </div>
+                        </div>
+                        <div id="diff-${func.name}" class="diff-container">
+                            <div style="margin-bottom: 10px;">
+                                <strong>📝 Changes for ${func.name}():</strong>
+                            </div>
+                            <div class="code-diff">
+                                <div class="code-original">
+                                    <strong>Original Version (${func.old_lines} lines):</strong>
+                                    <pre id="original-code-${func.name}">Loading...</pre>
+                                </div>
+                                <div class="code-modified">
+                                    <strong>Modified Version (${func.new_lines} lines):</strong>
+                                    <pre id="modified-code-${func.name}">Loading...</pre>
+                                </div>
+                            </div>
+                            <div>
+                                <strong>Unified Diff:</strong>
+                                <div id="unified-diff-${func.name}" class="diff-unified">Loading...</div>
+                            </div>
+                        </div>
                     </div>
                 `;
             });
-            document.getElementById('functions-modified').innerHTML = modifiedHtml || '<p>No functions modified</p>';
+            
+            container.innerHTML = html;
+            
+            // Load diffs for each modified function
+            modifiedFunctions.forEach(func => {
+                loadFunctionDiff(func.name);
+            });
+        }
 
-            // Classes changes
-            let classesHtml = '';
-            diff.classes_added.forEach(cls => {
-                classesHtml += `<div class="diff-added">➕ Class ${cls.name} - ${cls.line_count} lines</div>`;
-            });
-            diff.classes_removed.forEach(cls => {
-                classesHtml += `<div class="diff-removed">➖ Class ${cls.name} - ${cls.line_count} lines</div>`;
-            });
-            diff.classes_modified.forEach(cls => {
-                const changeSymbol = cls.difference > 0 ? '+' : '';
-                classesHtml += `<div class="diff-modified">✏️ Class ${cls.name} - ${cls.old_lines} → ${cls.new_lines} lines (${changeSymbol}${cls.difference})</div>`;
-            });
-            document.getElementById('classes-changes').innerHTML = classesHtml || '<p>No class changes</p>';
+        async function loadFunctionDiff(functionName) {
+            try {
+                const response = await fetch('/get-function-diff', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        original_code: currentOriginalCode,
+                        current_code: currentModifiedCode,
+                        function_name: functionName
+                    })
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    document.getElementById(`original-code-${functionName}`).textContent = data.original_code;
+                    document.getElementById(`modified-code-${functionName}`).textContent = data.current_code;
+                    
+                    const diffHtml = data.diff.map(line => {
+                        if (line.startsWith('+')) return `<span style="color: #28a745;">${escapeHtml(line)}</span>`;
+                        if (line.startsWith('-')) return `<span style="color: #dc3545;">${escapeHtml(line)}</span>`;
+                        return escapeHtml(line);
+                    }).join('\n');
+                    
+                    document.getElementById(`unified-diff-${functionName}`).innerHTML = diffHtml;
+                }
+            } catch (error) {
+                console.error('Error loading diff:', error);
+            }
+        }
 
-            // Import changes
-            let importsHtml = '';
-            diff.imports_added.forEach(imp => {
-                importsHtml += `<div class="diff-added">➕ ${imp}</div>`;
+        function toggleDiff(functionName) {
+            const diffContainer = document.getElementById(`diff-${functionName}`);
+            if (diffContainer.classList.contains('show')) {
+                diffContainer.classList.remove('show');
+            } else {
+                diffContainer.classList.add('show');
+            }
+        }
+
+        function confirmRevert(functionName) {
+            const func = currentModifiedFunctions.find(f => f.name === functionName);
+            if (!func) return;
+            
+            const modal = document.getElementById('confirm-modal');
+            if (!modal) {
+                createConfirmModal();
+            }
+            
+            const modalHtml = document.getElementById('confirm-modal');
+            const message = document.getElementById('confirm-message');
+            const confirmBtn = document.getElementById('modal-confirm-btn');
+            
+            message.innerHTML = `
+                <strong>Revert ${functionName}()</strong><br><br>
+                This will restore the function to its original version:<br>
+                • Current lines: ${func.new_lines}<br>
+                • Original lines: ${func.old_lines}<br>
+                • Change: ${func.difference > 0 ? '+' : ''}${func.difference} lines<br><br>
+                Do you want to proceed?
+            `;
+            
+            modalHtml.style.display = 'block';
+            
+            const oldOnClick = confirmBtn.onclick;
+            confirmBtn.onclick = () => {
+                revertSingleFunction(functionName);
+                modalHtml.style.display = 'none';
+            };
+        }
+
+        function createConfirmModal() {
+            const modal = document.createElement('div');
+            modal.id = 'confirm-modal';
+            modal.className = 'modal';
+            modal.innerHTML = `
+                <div class="modal-content">
+                    <h3>Confirm Revert</h3>
+                    <div id="confirm-message"></div>
+                    <div style="display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end;">
+                        <button onclick="document.getElementById('confirm-modal').style.display = 'none'" style="background: #6c757d;">Cancel</button>
+                        <button id="modal-confirm-btn" style="background: #ff9800;">Confirm Revert</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+        }
+
+        async function revertSingleFunction(functionName) {
+            try {
+                const response = await fetch('/revert-function', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        original_code: currentOriginalCode,
+                        current_code: currentModifiedCode,
+                        function_name: functionName
+                    })
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Update the current modified code
+                    currentModifiedCode = data.updated_code;
+                    document.getElementById('code2-input').value = currentModifiedCode;
+                    
+                    // Mark as reverted
+                    revertedFunctions.add(functionName);
+                    
+                    // Update UI
+                    const card = document.getElementById(`func-card-${functionName}`);
+                    if (card) {
+                        card.setAttribute('data-reverted', 'true');
+                        const badge = card.querySelector('.badge');
+                        if (badge) {
+                            badge.className = 'badge badge-reverted';
+                            badge.textContent = '✓ Reverted';
+                        }
+                        
+                        const revertBtn = document.getElementById(`revert-btn-${functionName}`);
+                        if (revertBtn) {
+                            revertBtn.disabled = true;
+                            revertBtn.textContent = '✓ Reverted';
+                            revertBtn.classList.add('btn-reverted');
+                        }
+                        
+                        const viewDiffBtn = card.querySelector('.btn-view-diff');
+                        if (viewDiffBtn) viewDiffBtn.disabled = true;
+                    }
+                    
+                    showToast(`✓ Successfully reverted ${functionName}()`);
+                    
+                    // Update the modified functions list to reflect changes
+                    await updateModifiedFunctionsList();
+                } else {
+                    showToast('Error: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showToast('Error reverting function: ' + error.message, 'error');
+            }
+        }
+
+        async function revertAllFunctions() {
+            const pendingFunctions = currentModifiedFunctions.filter(f => !revertedFunctions.has(f.name));
+            
+            if (pendingFunctions.length === 0) {
+                showToast('All functions have already been reverted!', 'info');
+                return;
+            }
+            
+            const modal = document.getElementById('confirm-modal');
+            if (!modal) createConfirmModal();
+            
+            const message = document.getElementById('confirm-message');
+            const confirmBtn = document.getElementById('modal-confirm-btn');
+            
+            message.innerHTML = `
+                <strong>Revert All Modified Functions</strong><br><br>
+                This will revert ${pendingFunctions.length} function(s) to their original versions:<br>
+                ${pendingFunctions.map(f => `• ${f.name}() (${f.old_lines} → ${f.new_lines} lines)`).join('<br>')}<br><br>
+                <strong>This action cannot be undone. Do you want to proceed?</strong>
+            `;
+            
+            modal.style.display = 'block';
+            
+            const oldOnClick = confirmBtn.onclick;
+            confirmBtn.onclick = async () => {
+                modal.style.display = 'none';
+                
+                const progressBar = document.getElementById('revert-progress-bar');
+                const progressFill = document.getElementById('revert-progress-fill');
+                progressBar.style.display = 'block';
+                
+                let reverted = 0;
+                
+                for (const func of pendingFunctions) {
+                    try {
+                        const response = await fetch('/revert-function', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                original_code: currentOriginalCode,
+                                current_code: currentModifiedCode,
+                                function_name: func.name
+                            })
+                        });
+                        const data = await response.json();
+                        
+                        if (data.success) {
+                            currentModifiedCode = data.updated_code;
+                            revertedFunctions.add(func.name);
+                            reverted++;
+                            
+                            const percent = (reverted / pendingFunctions.length) * 100;
+                            progressFill.style.width = `${percent}%`;
+                            
+                            // Update individual card
+                            const card = document.getElementById(`func-card-${func.name}`);
+                            if (card) {
+                                card.setAttribute('data-reverted', 'true');
+                                const badge = card.querySelector('.badge');
+                                if (badge) {
+                                    badge.className = 'badge badge-reverted';
+                                    badge.textContent = '✓ Reverted';
+                                }
+                                const revertBtn = document.getElementById(`revert-btn-${func.name}`);
+                                if (revertBtn) {
+                                    revertBtn.disabled = true;
+                                    revertBtn.textContent = '✓ Reverted';
+                                    revertBtn.classList.add('btn-reverted');
+                                }
+                                const viewDiffBtn = card.querySelector('.btn-view-diff');
+                                if (viewDiffBtn) viewDiffBtn.disabled = true;
+                            }
+                        }
+                    } catch (error) {
+                        console.error(`Error reverting ${func.name}:`, error);
+                    }
+                }
+                
+                document.getElementById('code2-input').value = currentModifiedCode;
+                progressBar.style.display = 'none';
+                showToast(`✓ Successfully reverted ${reverted} of ${pendingFunctions.length} functions`);
+                
+                await updateModifiedFunctionsList();
+            };
+        }
+
+        async function updateModifiedFunctionsList() {
+            // Re-compare to get updated list
+            const response = await fetch('/compare', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    code1: currentOriginalCode,
+                    code2: currentModifiedCode
+                })
             });
-            diff.imports_removed.forEach(imp => {
-                importsHtml += `<div class="diff-removed">➖ ${imp}</div>`;
-            });
-            document.getElementById('imports-changes').innerHTML = importsHtml || '<p>No import changes</p>';
+            const data = await response.json();
+            
+            if (data.success) {
+                currentModifiedFunctions = data.differences.functions_modified;
+                displayModifiedFunctions(currentModifiedFunctions);
+            }
+        }
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.style.backgroundColor = type === 'error' ? '#dc3545' : '#28a745';
+            toast.style.display = 'block';
+            
+            setTimeout(() => {
+                toast.style.display = 'none';
+            }, 3000);
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
         function loadExample1() {
-            document.getElementById('code1-input').value = `def process_data(data):
-    # Process the input data
+            document.getElementById('code1-input').value = `def validate_data(data):
+    # Validate input data
+    if not data:
+        return False
+    return all(isinstance(x, (int, float)) for x in data)
+
+def process_data(data):
+    # Process the data
     result = []
     for item in data:
         processed = item * 2
         result.append(processed)
     return result
 
-def save_output(result, filename):
-    # Save results to file
+def save_results(result, filename):
+    # Save to file
     with open(filename, 'w') as f:
         for item in result:
             f.write(str(item) + '\\n')
-    print(f"Saved to {filename}")
+    print("Saved successfully")
 
-class DataProcessor:
-    def __init__(self):
-        self.data = []
+def main_pipeline(data, output):
+    # Main processing function
+    if not validate_data(data):
+        raise ValueError("Invalid data")
     
-    def load(self, filename):
-        with open(filename, 'r') as f:
-            self.data = [int(line.strip()) for line in f]
-    
-    def process(self):
-        return process_data(self.data)`;
+    processed = process_data(data)
+    save_results(processed, output)
+    return processed`;
         }
 
         function loadExample2() {
-            document.getElementById('code2-input').value = `def process_data_optimized(data):
-    # Optimized processing with list comprehension
+            document.getElementById('code2-input').value = `def validate_data_enhanced(data):
+    # Enhanced validation with detailed errors
+    if not data:
+        return False, "Empty data provided"
+    if not all(isinstance(x, (int, float)) for x in data):
+        return False, "Invalid data types detected"
+    if len(data) > 1000:
+        return False, "Data too large"
+    return True, "Valid"
+
+def process_data_optimized(data):
+    # Optimized using list comprehension
     return [item * 2 for item in data]
 
-def save_output(result, filename, mode='w'):
-    # Save results to file with optional mode
+def log_process(message):
+    # New logging function
+    print(f"[LOG] {message}")
+
+def save_results_enhanced(result, filename, mode='w'):
+    # Enhanced save with mode parameter
     with open(filename, mode) as f:
-        for item in result:
-            f.write(str(item) + '\\n')
+        for idx, item in enumerate(result):
+            f.write(f"{idx}: {item}\\n")
     print(f"Saved to {filename}")
 
-def validate_data(data):
-    # New validation function
-    if not data:
-        raise ValueError("Empty data provided")
-    return all(isinstance(x, (int, float)) for x in data)
-
-class DataProcessor:
-    def __init__(self, name="Processor"):
-        self.data = []
-        self.name = name
+def main_pipeline(data, output):
+    # Updated main pipeline
+    is_valid, message = validate_data_enhanced(data)
+    if not is_valid:
+        log_process(f"Validation failed: {message}")
+        raise ValueError(message)
     
-    def load(self, filename):
-        with open(filename, 'r') as f:
-            self.data = [int(line.strip()) for line in f]
-        print(f"Loaded {len(self.data)} items")
+    log_process("Starting processing")
+    processed = process_data_optimized(data)
+    log_process(f"Processed {len(processed)} items")
     
-    def process(self):
-        if not validate_data(self.data):
-            return []
-        return process_data_optimized(self.data)
-    
-    def get_stats(self):
-        # New method
-        return {
-            'count': len(self.data),
-            'sum': sum(self.data),
-            'avg': sum(self.data) / len(self.data) if self.data else 0
-        }`;
+    save_results_enhanced(processed, output)
+    log_process("Pipeline completed")
+    return processed`;
         }
     </script>
 </body>
