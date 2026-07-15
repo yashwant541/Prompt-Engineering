@@ -1,535 +1,463 @@
-#!/usr/bin/env python3
-"""
-Financial Table Extractor - Standard Chartered Format
-Generates Excel output with the exact structure shown in the example
-"""
+You are the Lead Software Architect, Principal Python Engineer, Financial Systems Architect, Data Engineer, and AI Engineer responsible for designing and implementing a production-grade enterprise Financial Reconciliation Engine.
 
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
-import re
-import warnings
-warnings.filterwarnings('ignore')
+This is NOT a prototype.
 
-try:
-    import pdfplumber
-    HAS_PDFPLUMBER = True
-except ImportError:
-    HAS_PDFPLUMBER = False
-    print("Warning: pdfplumber not installed. Install with: pip install pdfplumber")
+This is NOT an example.
 
-class StandardCharteredExtractor:
-    """Extract and format financial tables in Standard Chartered style"""
-    
-    def __init__(self, pdf_path: str):
-        self.pdf_path = pdf_path
-        self.raw_tables = []
-        self.processed_tables = {}
-        
-    def extract_pdf_tables(self) -> List[pd.DataFrame]:
-        """Extract tables from PDF using pdfplumber"""
-        if not HAS_PDFPLUMBER:
-            raise ImportError("pdfplumber is required. Install with: pip install pdfplumber")
-        
-        tables = []
-        with pdfplumber.open(self.pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                page_tables = page.extract_tables()
-                for table in page_tables:
-                    if table and len(table) > 1:
-                        df = pd.DataFrame(table)
-                        # Clean empty rows/columns
-                        df = df.replace(r'^\s*$', None, regex=True)
-                        df = df.dropna(how='all')
-                        df = df.dropna(axis=1, how='all')
-                        
-                        if not df.empty:
-                            tables.append({
-                                'page': page_num,
-                                'data': df,
-                                'raw': table
-                            })
-        return tables
-    
-    def clean_value(self, value: Any) -> Any:
-        """Clean and parse numeric values"""
-        if pd.isna(value) or value is None:
-            return None
-        
-        if isinstance(value, (int, float)):
-            return value
-        
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if not cleaned:
-                return None
-            
-            # Remove currency symbols and commas
-            cleaned = cleaned.replace('$', '').replace(',', '').replace('€', '').replace('£', '')
-            
-            # Handle percentages
-            if cleaned.endswith('%'):
-                try:
-                    return float(cleaned[:-1])
-                except:
-                    return cleaned
-            
-            # Handle basis points
-            if 'bps' in cleaned.lower():
-                try:
-                    return float(cleaned.lower().replace('bps', '').strip())
-                except:
-                    return cleaned
-            
-            # Handle negative numbers in parentheses
-            if cleaned.startswith('(') and cleaned.endswith(')'):
-                cleaned = '-' + cleaned[1:-1]
-            
-            # Try to parse as number
-            try:
-                if '.' in cleaned:
-                    return float(cleaned)
-                else:
-                    return int(cleaned)
-            except:
-                return cleaned
-        
-        return value
-    
-    def detect_headers(self, df: pd.DataFrame) -> Tuple[Optional[int], Optional[int]]:
-        """Detect row and column headers in a table"""
-        header_row = None
-        header_col = None
-        
-        # Check first few rows for headers
-        for idx in range(min(3, len(df))):
-            row = df.iloc[idx].astype(str)
-            # Headers typically have more text than numbers
-            numeric_count = sum(1 for x in row if self._is_numeric(x))
-            text_count = len(row) - numeric_count
-            
-            if text_count > numeric_count and text_count > 1:
-                header_row = idx
-                break
-        
-        # Check first column for headers
-        if header_row is not None:
-            first_col = df.iloc[:, 0].astype(str)
-            numeric_count = sum(1 for x in first_col if self._is_numeric(x))
-            text_count = len(first_col) - numeric_count
-            
-            if text_count > numeric_count and text_count > 1:
-                header_col = 0
-        
-        return header_row, header_col
-    
-    def _is_numeric(self, value: str) -> bool:
-        """Check if a string is numeric"""
-        if not value or value.strip() == '':
-            return False
-        cleaned = value.replace(',', '').replace('$', '').replace('%', '') \
-                      .replace('(', '').replace(')', '').replace('bps', '').strip()
-        try:
-            float(cleaned)
-            return True
-        except:
-            return False
-    
-    def extract_key_value_pairs(self, df: pd.DataFrame) -> List[Dict]:
-        """Extract key-value pairs from a table"""
-        pairs = []
-        
-        if df.empty:
-            return pairs
-        
-        # Clean the dataframe
-        df_clean = df.copy()
-        df_clean = df_clean.replace(r'^\s*$', None, regex=True)
-        df_clean = df_clean.dropna(how='all')
-        df_clean = df_clean.dropna(axis=1, how='all')
-        
-        if df_clean.empty:
-            return pairs
-        
-        # Detect structure
-        header_row, header_col = self.detect_headers(df_clean)
-        
-        # Case 1: Matrix table with both row and column headers
-        if header_row is not None and header_col is not None and len(df_clean) > 2 and len(df_clean.columns) > 2:
-            pairs = self._extract_matrix_table(df_clean, header_row, header_col)
-        
-        # Case 2: Simple table with row headers only
-        elif header_col is not None:
-            pairs = self._extract_simple_table(df_clean, header_col)
-        
-        # Case 3: Simple table with column headers only
-        elif header_row is not None:
-            pairs = self._extract_column_header_table(df_clean, header_row)
-        
-        # Case 4: No headers - use first column as key
-        else:
-            pairs = self._extract_no_header_table(df_clean)
-        
-        return pairs
-    
-    def _extract_matrix_table(self, df: pd.DataFrame, header_row: int, header_col: int) -> List[Dict]:
-        """Extract from matrix table with both row and column headers"""
-        pairs = []
-        
-        # Get column headers
-        col_headers = []
-        for col_idx in range(len(df.columns)):
-            val = df.iloc[header_row, col_idx]
-            col_headers.append(str(val).strip() if pd.notna(val) else f"Col_{col_idx}")
-        
-        # Get row headers
-        row_headers = []
-        for row_idx in range(len(df)):
-            if row_idx != header_row:
-                val = df.iloc[row_idx, header_col]
-                row_headers.append(str(val).strip() if pd.notna(val) else f"Row_{row_idx}")
-        
-        # Extract values
-        for row_idx in range(len(df)):
-            if row_idx == header_row:
-                continue
-            row_header = row_headers[row_idx - 1] if row_idx > header_row else row_headers[row_idx]
-            
-            for col_idx in range(len(df.columns)):
-                if col_idx == header_col:
-                    continue
-                col_header = col_headers[col_idx]
-                value = self.clean_value(df.iloc[row_idx, col_idx])
-                
-                if value is not None and str(value).strip():
-                    key = f"{row_header} - {col_header}"
-                    pairs.append({
-                        'key': key,
-                        'value': value,
-                        'row_key': row_header,
-                        'col_key': col_header,
-                        'unit': self._detect_unit(str(df.iloc[row_idx, col_idx]))
-                    })
-        
-        return pairs
-    
-    def _extract_simple_table(self, df: pd.DataFrame, header_col: int) -> List[Dict]:
-        """Extract from simple table with row headers only"""
-        pairs = []
-        
-        # Use first column as keys
-        for idx in range(len(df)):
-            key = str(df.iloc[idx, header_col]).strip() if pd.notna(df.iloc[idx, header_col]) else f"Row_{idx}"
-            if not key or key == 'nan':
-                continue
-                
-            for col_idx in range(len(df.columns)):
-                if col_idx == header_col:
-                    continue
-                value = self.clean_value(df.iloc[idx, col_idx])
-                if value is not None and str(value).strip():
-                    col_key = f"Column_{col_idx}"
-                    if idx > 0:
-                        # Use first row as column headers if available
-                        if pd.notna(df.iloc[0, col_idx]):
-                            col_key = str(df.iloc[0, col_idx]).strip()
-                    
-                    pairs.append({
-                        'key': key if idx > 0 else f"{key} - {col_key}",
-                        'value': value,
-                        'row_key': key,
-                        'col_key': col_key,
-                        'unit': self._detect_unit(str(df.iloc[idx, col_idx]))
-                    })
-        
-        return pairs
-    
-    def _extract_column_header_table(self, df: pd.DataFrame, header_row: int) -> List[Dict]:
-        """Extract from table with column headers only"""
-        pairs = []
-        
-        # Use header row as column headers
-        col_headers = []
-        for col_idx in range(len(df.columns)):
-            val = df.iloc[header_row, col_idx]
-            col_headers.append(str(val).strip() if pd.notna(val) else f"Col_{col_idx}")
-        
-        # Use first column as row identifiers
-        for row_idx in range(len(df)):
-            if row_idx == header_row:
-                continue
-            row_key = str(df.iloc[row_idx, 0]).strip() if pd.notna(df.iloc[row_idx, 0]) else f"Row_{row_idx}"
-            
-            for col_idx in range(len(df.columns)):
-                if col_idx == 0:
-                    continue
-                value = self.clean_value(df.iloc[row_idx, col_idx])
-                if value is not None and str(value).strip():
-                    col_key = col_headers[col_idx]
-                    key = f"{row_key} - {col_key}"
-                    pairs.append({
-                        'key': key,
-                        'value': value,
-                        'row_key': row_key,
-                        'col_key': col_key,
-                        'unit': self._detect_unit(str(df.iloc[row_idx, col_idx]))
-                    })
-        
-        return pairs
-    
-    def _extract_no_header_table(self, df: pd.DataFrame) -> List[Dict]:
-        """Extract from table with no headers"""
-        pairs = []
-        
-        for idx in range(len(df)):
-            key = str(df.iloc[idx, 0]).strip() if len(df.columns) > 0 else f"Row_{idx}"
-            if not key or key == 'nan':
-                continue
-                
-            for col_idx in range(1, len(df.columns)):
-                value = self.clean_value(df.iloc[idx, col_idx])
-                if value is not None and str(value).strip():
-                    pairs.append({
-                        'key': key,
-                        'value': value,
-                        'row_key': key,
-                        'col_key': f"Col_{col_idx}",
-                        'unit': self._detect_unit(str(df.iloc[idx, col_idx]))
-                    })
-        
-        return pairs
-    
-    def _detect_unit(self, value: str) -> str:
-        """Detect unit from value string"""
-        if not value:
-            return ""
-        if '%' in value:
-            return "%"
-        if 'bps' in value.lower():
-            return "bps"
-        if '$million' in value or 'million' in value.lower():
-            return "$million"
-        if '$billion' in value or 'billion' in value.lower():
-            return "$billion"
-        if 'cents' in value.lower():
-            return "cents"
-        if '$' in value:
-            return "$"
-        if 'x' in value or 'times' in value.lower():
-            return "x"
-        return ""
-    
-    def process_all_tables(self) -> Dict[str, pd.DataFrame]:
-        """Process all extracted tables into the desired format"""
-        tables = self.extract_pdf_tables()
-        
-        processed = {}
-        table_counter = 1
-        
-        for table_info in tables:
-            df = table_info['data']
-            page = table_info['page']
-            
-            # Get key-value pairs
-            pairs = self.extract_key_value_pairs(df)
-            
-            if pairs:
-                # Create dataframe in the format: Metric | Period | Value
-                df_pairs = pd.DataFrame(pairs)
-                
-                # If there are period indicators in keys, try to extract them
-                period_col = None
-                value_col = None
-                
-                # Check if we have period data
-                periods = ['Q1\'26', 'Q1\'25', 'Q4\'25', 'Q3\'25', 'Q2\'25', 
-                          '31.03.26', '31.12.25', '31.03.25',
-                          'FY\'25', '3 months ended 31.03.26', '3 months ended 31.03.25']
-                
-                # Create clean data structure
-                clean_rows = []
-                for pair in pairs:
-                    # Try to extract period from key
-                    key = pair.get('key', '')
-                    value = pair.get('value', '')
-                    unit = pair.get('unit', '')
-                    
-                    # Check if key contains period info
-                    period_found = None
-                    for period in periods:
-                        if period in key:
-                            period_found = period
-                            key = key.replace(period, '').strip(' -')
-                            break
-                    
-                    # Check if key contains metric
-                    if ' - ' in key:
-                        parts = key.split(' - ')
-                        if len(parts) == 2:
-                            metric = parts[0].strip()
-                            if not period_found:
-                                # Try to find period in the second part
-                                for period in periods:
-                                    if period in parts[1]:
-                                        period_found = period
-                                        break
-                            if period_found:
-                                clean_rows.append({
-                                    'Metric': metric,
-                                    'Period': period_found,
-                                    'Value': value
-                                })
-                            else:
-                                clean_rows.append({
-                                    'Metric': key,
-                                    'Period': pair.get('col_key', ''),
-                                    'Value': value
-                                })
-                    else:
-                        # Simple key-value
-                        if period_found:
-                            clean_rows.append({
-                                'Metric': key,
-                                'Period': period_found,
-                                'Value': value
-                            })
-                        else:
-                            clean_rows.append({
-                                'Metric': key,
-                                'Period': pair.get('col_key', ''),
-                                'Value': value
-                            })
-                
-                if clean_rows:
-                    result_df = pd.DataFrame(clean_rows)
-                    # Remove rows with empty values
-                    result_df = result_df[result_df['Value'].notna()]
-                    result_df = result_df[result_df['Value'] != '']
-                    
-                    if not result_df.empty:
-                        table_name = f"Table_{table_counter}"
-                        processed[table_name] = result_df
-                        table_counter += 1
-        
-        return processed
-    
-    def create_index_sheet(self) -> pd.DataFrame:
-        """Create the index/table of contents sheet"""
-        index_data = [
-            ['Standard Chartered PLC - Q1\'26 Results - Extracted Financial Tables', ''],
-            ['Source: standard-chartered-plc-q1-2026-press-release.pdf', ''],
-            ['', ''],
-            ['#', 'Sheet Name']
-        ]
-        
-        for i, (name, _) in enumerate(self.processed_tables.items(), 1):
-            index_data.append([i, name])
-        
-        return pd.DataFrame(index_data)
-    
-    def export_to_excel(self, output_path: str):
-        """Export all processed tables to Excel"""
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Create index sheet
-            index_df = self.create_index_sheet()
-            index_df.to_excel(writer, sheet_name='Index', index=False, header=False)
-            
-            # Export each table
-            for table_name, df in self.processed_tables.items():
-                # Clean sheet name (max 31 chars)
-                sheet_name = table_name[:31].replace('Table_', 'T')
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-            
-            # Format the workbook
-            self._format_workbook(writer.book)
-        
-        print(f"✅ Data exported to: {output_path}")
-        print(f"   Total sheets: {len(self.processed_tables) + 1}")
-    
-    def _format_workbook(self, workbook):
-        """Apply formatting to the Excel workbook"""
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        
-        for sheet_name in workbook.sheetnames:
-            sheet = workbook[sheet_name]
-            
-            # Auto-adjust column widths
-            for column in sheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if cell.value:
-                            max_length = max(max_length, len(str(cell.value)))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)
-                sheet.column_dimensions[column_letter].width = adjusted_width
-            
-            # Apply header formatting (first row)
-            if sheet.max_row > 0:
-                for cell in sheet[1]:
-                    if cell.value:
-                        cell.font = Font(bold=True)
-                        cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-                        cell.font = Font(color="FFFFFF", bold=True)
-                        cell.alignment = Alignment(horizontal='center', vertical='center')
-    
-    def generate_summary(self) -> Dict:
-        """Generate a summary of extracted data"""
-        summary = {
-            'total_tables': len(self.processed_tables),
-            'table_names': list(self.processed_tables.keys()),
-            'total_rows': sum(len(df) for df in self.processed_tables.values())
-        }
-        return summary
+This is NOT pseudocode.
 
+This is NOT a proof of concept.
 
-def main():
-    """Main execution function"""
-    print("=" * 70)
-    print("STANDARD CHARTERED FINANCIAL TABLE EXTRACTOR")
-    print("=" * 70)
-    
-    # File path - update this
-    pdf_path = "standard-chartered-plc-q1-2026-press-release.pdf"
-    
-    if not Path(pdf_path).exists():
-        print(f"\n❌ File not found: {pdf_path}")
-        print("Please update the pdf_path variable with the correct file path.")
-        return
-    
-    try:
-        # Initialize extractor
-        extractor = StandardCharteredExtractor(pdf_path)
-        
-        print(f"\n📄 Processing: {pdf_path}")
-        print("   Extracting tables...")
-        
-        # Process tables
-        extractor.processed_tables = extractor.process_all_tables()
-        
-        # Generate summary
-        summary = extractor.generate_summary()
-        
-        print(f"\n📊 Extraction complete!")
-        print(f"   Tables found: {summary['total_tables']}")
-        print(f"   Total rows: {summary['total_rows']}")
-        print(f"   Table names: {', '.join(summary['table_names'][:5])}...")
-        
-        # Export to Excel
-        output_path = "Standard_Chartered_Q1_2026_Financial_Tables.xlsx"
-        extractor.export_to_excel(output_path)
-        
-        print("\n✅ Done!")
-        
-    except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+You are building an enterprise software product that will eventually exceed 50,000+ lines of production-quality Python code.
 
+Your responsibility is to act as the lead architect and senior engineer throughout the entire project.
 
-if __name__ == "__main__":
-    main()
+--------------------------------------------------------
+PROJECT GOAL
+--------------------------------------------------------
+
+Build an enterprise-grade financial reconciliation engine capable of reconciling multiple financial documents uploaded on two sides.
+
+LEFT SIDE
+
+• Multiple PDFs
+• Multiple DOCX
+• Multiple Excel Workbooks
+• Multiple CSV
+
+RIGHT SIDE
+
+• Multiple PDFs
+• Multiple DOCX
+• Multiple Excel Workbooks
+• Multiple CSV
+
+Users upload files temporarily.
+
+Files are processed entirely in memory.
+
+Nothing is stored permanently unless explicitly exported.
+
+--------------------------------------------------------
+IMPORTANT CONSTRAINTS
+--------------------------------------------------------
+
+This project will run inside Dataiku.
+
+Do NOT use
+
+FastAPI
+Flask
+Django
+Docker
+Kubernetes
+Celery
+RabbitMQ
+
+The engine must be written entirely in Python.
+
+The engine must be independent of Dataiku except for a very thin integration layer.
+
+Every parser must accept
+
+filename
+bytes
+
+NOT file paths.
+
+--------------------------------------------------------
+CODING STANDARDS
+--------------------------------------------------------
+
+Python 3.12
+
+Strong typing
+
+Dataclasses
+
+Enums
+
+Logging
+
+SOLID
+
+Dependency Injection
+
+Factory Pattern
+
+Strategy Pattern
+
+Repository Pattern
+
+Builder Pattern
+
+Clean Architecture
+
+Every class must have one responsibility.
+
+No giant classes.
+
+No giant functions.
+
+No hardcoding.
+
+Everything configurable.
+
+--------------------------------------------------------
+CRITICAL DEVELOPMENT RULES
+--------------------------------------------------------
+
+NEVER generate the entire project at once.
+
+NEVER create placeholder code.
+
+NEVER use TODO methods.
+
+NEVER leave empty implementations.
+
+NEVER write pseudocode.
+
+NEVER skip error handling.
+
+NEVER generate incomplete modules.
+
+Instead...
+
+Build the software exactly like a professional engineering team.
+
+The project must be developed incrementally.
+
+Each response represents ONE COMPLETE DEVELOPMENT SPRINT.
+
+Each sprint must be fully functional before proceeding to the next.
+
+--------------------------------------------------------
+EVERY SPRINT MUST CONTAIN
+--------------------------------------------------------
+
+1.
+
+Updated folder tree
+
+2.
+
+New Python files
+
+3.
+
+Complete implementations
+
+4.
+
+Unit tests
+
+5.
+
+Usage examples
+
+6.
+
+Updated architecture
+
+7.
+
+Dependency explanation
+
+8.
+
+What changed
+
+9.
+
+Next sprint plan
+
+--------------------------------------------------------
+PROJECT STRUCTURE
+--------------------------------------------------------
+
+FinanceReconAI/
+
+financial_reconciliation/
+
+config/
+
+core/
+
+models/
+
+parsers/
+
+extractors/
+
+normalization/
+
+ontology/
+
+matching/
+
+reconciliation/
+
+exporters/
+
+reports/
+
+utils/
+
+tests/
+
+README.md
+
+ARCHITECTURE.md
+
+CHANGELOG.md
+
+TODO.md
+
+requirements.txt
+
+--------------------------------------------------------
+ARCHITECTURE
+--------------------------------------------------------
+
+The engine revolves around one object only.
+
+ReconciliationSession
+
+Every module updates this session.
+
+Nothing passes around raw DataFrames internally.
+
+Use rich domain objects.
+
+UploadedDocument
+
+FinancialDocument
+
+FinancialTable
+
+FinancialSection
+
+FinancialRecord
+
+MatchCandidate
+
+Match
+
+ReconciliationResult
+
+Only exporters convert to DataFrames.
+
+--------------------------------------------------------
+PIPELINE
+--------------------------------------------------------
+
+Upload
+
+↓
+
+Parser
+
+↓
+
+Extraction
+
+↓
+
+Hierarchy Builder
+
+↓
+
+Normalization
+
+↓
+
+Ontology Mapping
+
+↓
+
+Candidate Generation
+
+↓
+
+Matching
+
+↓
+
+Confidence Scoring
+
+↓
+
+Reconciliation
+
+↓
+
+Exception Analysis
+
+↓
+
+Reporting
+
+--------------------------------------------------------
+PARSERS
+--------------------------------------------------------
+
+PDF
+
+DOCX
+
+XLSX
+
+XLS
+
+CSV
+
+All parsers must output
+
+ExtractionResult
+
+which contains
+
+FinancialDocument
+
+FinancialTables
+
+FinancialRecords
+
+Warnings
+
+Metadata
+
+Statistics
+
+--------------------------------------------------------
+MATCHING
+--------------------------------------------------------
+
+Matching combines
+
+Exact
+
+RapidFuzz
+
+Semantic
+
+Numeric
+
+Hierarchy
+
+Section
+
+Neighbour
+
+Aliases
+
+Ontology
+
+Weighted confidence.
+
+Every match must explain WHY it matched.
+
+--------------------------------------------------------
+OUTPUT
+--------------------------------------------------------
+
+Matched
+
+Unmatched
+
+Variance
+
+Variance %
+
+Reason
+
+Confidence
+
+Matching Strategy
+
+Explanation
+
+--------------------------------------------------------
+LONG TERM ROADMAP
+--------------------------------------------------------
+
+Version 0.1
+
+Foundation
+
+Version 0.2
+
+Models
+
+Version 0.3
+
+Parsers
+
+Version 0.4
+
+Extraction
+
+Version 0.5
+
+Normalization
+
+Version 0.6
+
+Ontology
+
+Version 0.7
+
+Matching
+
+Version 0.8
+
+Reconciliation
+
+Version 0.9
+
+Reports
+
+Version 1.0
+
+Production Release
+
+--------------------------------------------------------
+IMPORTANT
+
+Think like the lead architect of a commercial software product.
+
+Optimize for maintainability.
+
+Optimize for extensibility.
+
+Optimize for performance.
+
+Optimize for readability.
+
+Build reusable components.
+
+Do not rush.
+
+Do not skip architecture.
+
+Every decision should support a software product that could eventually reach 100,000+ lines of Python code.
+
+When writing code:
+
+Generate complete production-quality files.
+
+Maintain import consistency.
+
+Maintain folder consistency.
+
+Maintain object-oriented design.
+
+Always assume previous sprints already exist.
+
+Never regenerate unchanged files.
+
+Only generate new or modified files for the current sprint.
+
+Maintain backward compatibility across all sprints.
+
+Always finish a sprint completely before moving to the next.
