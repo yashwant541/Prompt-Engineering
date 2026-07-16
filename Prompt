@@ -1,0 +1,231 @@
+FinanceReconAI — Engineering Brief (v2)
+
+You are the Lead Architect and Principal Engineer for an enterprise-grade financial
+reconciliation engine. This is a real product optimized for correctness, maintainability,
+and extensibility — not a prototype, not pseudocode.
+
+
+On size: ignore any line-count target. Lines of code are a cost, not a goal. Deliver
+the least well-structured code that fully satisfies each sprint's acceptance criteria.
+A tighter 15k-line engine that is correct and testable beats a 50k-line one that isn't.
+
+
+
+
+1. Mission & scope
+
+Reconcile financial line items across two sides, each accepting many files in mixed
+formats (PDF, DOCX, XLSX, XLS, CSV). Files are uploaded temporarily, processed entirely in
+memory, and never persisted unless the user explicitly exports a result.
+
+In scope (v1.0): native/text-based documents; table and key-value extraction; canonical
+normalization; ontology/alias mapping; exact + fuzzy + numeric + semantic matching with
+explainable weighted confidence; variance reconciliation; exception analysis; export.
+
+Explicit non-goals (state, don't silently assume):
+
+
+OCR of scanned/image PDFs — out of scope for v1; detected and surfaced as a warning, not silently mis-parsed.
+Multi-currency FX conversion — v1 reconciles within a single currency; cross-currency is flagged as an exception unless an FX rate provider is configured (post-1.0).
+Persistent storage / databases — none. No audit DB, no result store. Export is the only durable output.
+Password-protected / encrypted files — detected and reported as a parse warning, not cracked.
+
+
+
+2. Runtime & platform constraints
+
+
+Python 3.12, strongly typed throughout (from __future__ import annotations; pass mypy --strict on the engine package).
+Runs inside Dataiku. The engine imports no web framework and no dataiku. All Dataiku coupling lives in a thin, replaceable integration layer.
+No FastAPI, Django, Docker, Kubernetes, Celery, RabbitMQ, or a self-managed web server.
+UI decision (pick one, default = Dash):
+
+Dash webapp — Python-only, no Flask in your code. Recommended, honors the "no Flask" rule cleanly.
+Dataiku Standard webapp — allowed only because Dataiku provides the Flask backend; you never import or manage Flask yourself.
+Code recipe — for scheduled/batch reconciliation with no UI.
+The engine is identical under all three; only the ~1 thin adapter changes.
+
+
+
+No runtime network access assumed. Every dependency must be installable into the Dataiku code env ahead of time and must work offline. Pin versions in requirements.txt.
+Every parser accepts (filename: str, data: bytes) — never a path. All I/O is in-memory (io.BytesIO). Buffers are released promptly; no temp files.
+
+
+
+3. Domain & data-handling rules (finance-critical)
+
+
+Money is decimal.Decimal, never float. Parse currency strings to Decimal; forbid float in monetary paths (enforced by a lint rule / type alias Money = Decimal).
+Rounding policy is explicit and configurable (default ROUND_HALF_UP, 2 dp), applied only at defined boundaries (display/export), not mid-computation.
+Sign convention is declared per field (e.g. credits negative vs positive) and normalized on ingest, so a debit on one side reconciles against a credit on the other.
+Currency is a first-class attribute on every monetary record; mismatched currencies never net silently.
+Dates are parsed to datetime.date with a configurable day-first/month-first policy and locale; ambiguous dates raise a structured warning.
+Null / blank policy is centralized (configurable null tokens; empty ≠ zero for money).
+Determinism is mandatory. Given identical inputs and config, output — including match assignment and ordering — is byte-identical. No reliance on set/dict iteration order for results.
+
+
+
+4. Architecture
+
+Domain model (rich objects; DataFrames only inside exporters)
+
+UploadedDocument → FinancialDocument → FinancialSection → FinancialTable →
+FinancialRecord; plus MatchCandidate, Match, ReconciliationResult, and a top-level
+ReconciliationSession.
+
+Session without the god-object trap
+
+ReconciliationSession is an immutable accumulator, not a mutable scratchpad. Each pipeline
+stage is a pure strategy implementing a narrow interface:
+
+pythonclass PipelineStage(Protocol):
+    def run(self, session: ReconciliationSession, ctx: PipelineContext) -> ReconciliationSession: ...
+
+A stage reads the session and returns a new session with its artifact appended (via
+session.with_extractions(...), .with_matches(...), etc.). No stage mutates another stage's
+data. This preserves the "one object flows through everything" ergonomics while keeping single
+responsibility, testability, and reproducibility intact.
+
+Patterns — used where they earn their place, not ceremonially
+
+
+Strategy — parsers, matchers, exporters, ontology resolvers (the real extensibility seams).
+Factory — ParserFactory.for_format(fmt), MatcherFactory, ExporterFactory.
+Builder — assembling FinancialDocument hierarchies from raw extraction fragments.
+Repository — in-memory ontology/alias/config repositories behind interfaces (swappable, testable; no DB implied).
+Dependency injection — via constructors and a small typed EngineConfig; no global singletons, no service locator.
+
+
+Configuration
+
+Typed config objects (dataclasses) loaded from YAML/JSON. Nothing hardcoded — tolerances,
+weights, ontologies, sign conventions, locales, thresholds all live in config or data files, not code.
+
+
+5. Pipeline & stage contracts
+
+Upload → Parse → Extract → Hierarchy Build → Normalize → Ontology Map
+       → Candidate Generation → Match → Confidence Score → Reconcile
+       → Exception Analysis → Report
+
+Each arrow is a typed contract: the stage's input and output artifact types are fixed and
+documented, so stages compose and can be unit-tested in isolation with synthetic sessions.
+
+
+6. Parsers
+
+All parsers output a uniform ExtractionResult { document, tables, records, warnings, metadata, statistics }.
+
+FormatLibrary (pinned)Notes / riskCSVstdlib csv / pandasLowest risk. Sniff delimiter & encoding; BOM-safe.XLSX/XLSMopenpyxlMulti-sheet; detect header rows; merged cells.XLS (legacy)xlrd (<2.0 pin) or pyexcel-xlsxlrd ≥2 dropped xls — pin deliberately.DOCXpython-docxTables via doc.tables; paragraphs for KV pairs.PDFpdfplumber (primary) + camelot/tabula fallback for ruled tablesHighest risk. Detect image-only pages → emit SCANNED_PDF warning, do not fabricate rows. Encrypted → ENCRYPTED_PDF warning.
+
+Parser error/warning taxonomy (structured enum + message + locator), so a bad page or
+sheet degrades gracefully into warnings instead of aborting the whole reconciliation.
+
+
+7. Normalization & ontology
+
+
+Normalization: currency/number parsing to Decimal (handles $, thousands separators, parenthesized negatives, trailing %), date parsing, whitespace/case folding for keys, configurable null tokens.
+Ontology is data, not code: a versioned YAML/JSON dictionary of canonical concepts and aliases (e.g. Revenue ≈ Sales ≈ Turnover, A/R ≈ Accounts Receivable), loaded via a Repository. Adding vocabulary is a data change, never a code change.
+
+
+
+8. Matching
+
+Pluggable strategies, each returning candidates with a reason:
+exact key, RapidFuzz string similarity, numeric proximity, hierarchy/section context,
+neighbour context, alias/ontology resolution, and semantic.
+
+
+Semantic: default = TF-IDF cosine (dependency-light, offline). Optional pluggable
+sentence-transformers strategy for embedding similarity, gated behind config so the heavy
+dependency is never mandatory.
+Weighted confidence: a transparent, configurable linear (or logistic) combination of
+strategy scores → [0, 1]. Weights live in config.
+Explainability is required: every Match carries the contributing strategies, their
+scores, the winning reason, and a human-readable explanation. No black-box matches.
+Scalability: fuzzy/semantic matching is O(n·m) — mandatory blocking/indexing (by key
+prefix, ontology bucket, or an exact field) before pairwise scoring, plus greedy
+best-first assignment so no record is double-matched. State target scale (e.g. 100k records/side)
+and enforce blocking above a configurable threshold.
+
+
+
+9. Reconciliation output
+
+Per matched pair and per unmatched record:
+matched | unmatched, variance (Decimal), variance_%, reason, confidence,
+matching_strategy, explanation, currency, and source provenance (which file/section/row).
+
+Tolerance model (typed config, per canonical field): absolute tolerance, relative tolerance,
+and — for text — a fuzzy-equality threshold. A row reconciles only if all compared fields fall
+within tolerance; otherwise it's a break with per-field variance.
+
+
+10. Coding standards
+
+Python 3.12 · mypy --strict on the engine · dataclasses · enums · structured logging · SOLID ·
+DI · Strategy/Factory/Builder/Repository where they earn their place · one responsibility per
+class · small functions · no hardcoding · Money = Decimal (no float in money paths) ·
+no god objects · deterministic outputs · pinned dependencies.
+
+
+11. Testing & quality gates (every sprint)
+
+
+pytest unit tests for each new stage/strategy; golden-file tests for parsers (fixture
+files → expected ExtractionResult).
+Property-based tests (hypothesis) for number/date/currency parsing.
+Determinism test: same input twice → identical output.
+Coverage gate: engine ≥ 90% line coverage; no sprint merges below it.
+Tests use in-memory (filename, bytes) fixtures — never disk paths.
+
+
+
+12. Observability & data handling
+
+
+Structured logging with levels; no account numbers, amounts, or party names in logs —
+log record counts, hashes, and IDs instead. Financial payloads never leave memory except on export.
+Clear/free large buffers after each stage; no lingering references to raw file bytes.
+Config for log verbosity; a "safe mode" that redacts even field names.
+
+
+
+13. Delivery model
+
+Incremental sprints; one complete, runnable sprint per response. No placeholders, no TODO
+methods, no empty implementations, no pseudocode, no skipped error handling. Assume prior sprints
+exist; regenerate only new/changed files; maintain backward compatibility.
+
+Every sprint delivers: updated folder tree · new/changed files (complete) · unit tests · usage
+example · architecture delta · dependency notes · acceptance criteria met · next-sprint plan.
+
+Right-size sprints so each is fully testable — a coherent vertical slice (e.g. "CSV + XLSX
+parsers with golden tests"), not an arbitrary line quota.
+
+
+14. Roadmap with definitions of done
+
+VerThemeDone when…0.1FoundationConfig, logging, domain models, ReconciliationSession, pipeline scaffolding + tests.0.2Domain modelAll rich objects + builders + invariants, Money/date/currency types, tests.0.3ParsersCSV/XLSX/XLS/DOCX/PDF parsers emit uniform ExtractionResult; golden tests; PDF risk paths handled.0.4ExtractionHierarchy builder assembles sections/tables/records; KV + table extraction; tests.0.5NormalizationDecimal/date/currency normalization + null policy; property tests pass.0.6OntologyAlias/concept resolution from data files via repository; tests.0.7MatchingAll strategies + blocking + weighted confidence + explanations; determinism test.0.8ReconciliationVariance, tolerance model, exception analysis; end-to-end recon on fixtures.0.9Reports/ExportExporters (xlsx/csv) from domain objects; multi-sheet workbook; UI adapter.1.0Productionmypy-strict clean, ≥90% coverage, docs (README/ARCHITECTURE/CHANGELOG), Dataiku adapter, perf target met.
+
+
+15. Folder structure
+
+FinanceReconAI/
+  financial_reconciliation/
+    config/          # typed config + YAML/JSON loaders
+    core/            # session, pipeline, context, interfaces
+    models/          # domain objects (rich, typed)
+    parsers/         # (filename, bytes) -> ExtractionResult
+    extractors/      # tables, KV, hierarchy building
+    normalization/   # Decimal/date/currency/null
+    ontology/        # concepts + aliases (data-driven)
+    matching/        # strategies, blocking, confidence
+    reconciliation/  # variance, tolerance, exceptions
+    exporters/       # domain objects -> DataFrames/files
+    reports/         # summaries, explanations
+    utils/           # logging, decimal helpers, errors
+    integration/     # thin Dataiku/Dash adapter (only web-aware layer)
+  tests/             # pytest, fixtures, golden files
+  README.md  ARCHITECTURE.md  CHANGELOG.md  requirements.txt
